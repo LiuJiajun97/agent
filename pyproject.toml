@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minimal-python-agent"
+version = "0.1.0"
+description = "A minimal OpenAI Responses API agent with function calling"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.66.0",
+    "python-dotenv>=1.0.0",
+    "langchain>=1.0",
+    "langchain-openai>=1.0",
+    "langgraph>=1.0",
+]
+
+[project.scripts]
+minimal-agent = "agent.cli:main"
+minimal-agent-lc = "agent_lc.cli:main"
+minimal-agent-lg = "agent_lg.cli:main"
+
+[tool.setuptools]
+packages = ["agent", "agent_lc", "agent_lg"]
