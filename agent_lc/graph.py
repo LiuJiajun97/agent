@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 from typing import Any, Iterator
 
-from agent.config import MAX_STEPS, MODEL, SYSTEM_PROMPT
+from agent.config import API_STYLE, MAX_STEPS, MODEL, SYSTEM_PROMPT
 from agent_lc.tools import build_tools
 
 # LangGraph 的 recursion_limit 计数的是图超级步：
@@ -23,31 +23,39 @@ RECURSION_LIMIT = MAX_STEPS * 2
 DEFAULT_THREAD_ID = "default"
 
 
-def build_model(streaming: bool = True) -> Any:
+def build_model(streaming: bool = True, api_style: str | None = None) -> Any:
     """构造 ChatOpenAI 模型客户端。
 
     显式传 api_key 和 base_url，而不是依赖 SDK 隐式读环境变量，
     这样即使换网关也只需改 .env，行为可预期。
 
-    use_responses_api=True：走 OpenAI Responses API（/v1/responses），
-    和手写版 agent/ 保持同一个端点，三套实现的对照才公平。
+    api_style 不传时用 OPENAI_API_STYLE：
+    - responses：走 /v1/responses，和手写版默认行为一致。
+    - chat：走 /v1/chat/completions，兼容只支持 Chat Completions 的网关。
 
-    output_version="responses/v1"：让 reasoning 摘要、内置工具调用等
-    响应项落进 AIMessage.content（内容块列表）而不是 additional_kwargs，
-    这是 langchain-openai 官方推荐的新格式。
+    output_version="responses/v1" 只在 Responses 模式下设置：
+    它让 reasoning 摘要、内置工具调用等响应项落进 AIMessage.content
+    （内容块列表）而不是 additional_kwargs。Chat 模式下 content 本来就是字符串。
 
     streaming=True 表示走流式接口：即使调用 invoke()，
     底层也是流式请求再聚合，对应 graph.stream() 能拿到逐字增量。
     """
     from langchain_openai import ChatOpenAI
 
+    style = (api_style or API_STYLE).strip().lower()
+    if style not in ("responses", "chat"):
+        raise ValueError(f"未知的 API 风格: {style!r}（可选 responses / chat）")
+
+    options: dict[str, Any] = {"use_responses_api": style == "responses"}
+    if style == "responses":
+        options["output_version"] = "responses/v1"
+
     return ChatOpenAI(
         model=MODEL,
         api_key=os.getenv("OPENAI_API_KEY"),
         base_url=os.getenv("OPENAI_BASE_URL") or None,
-        use_responses_api=True,
-        output_version="responses/v1",
         streaming=streaming,
+        **options,
     )
 
 

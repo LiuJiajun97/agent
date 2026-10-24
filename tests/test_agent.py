@@ -1,14 +1,26 @@
+"""手写版测试：不调用真实 API，不需要 API Key。
+
+覆盖三部分：
+- 工具实现（与 API 无关）
+- 规范化历史 + 循环（注入 Turn）
+- 两个 API 后端的端到端封装（Responses / Chat Completions）
+"""
+
 from __future__ import annotations
 
 import json
 import unittest
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any
 
 import agent
 
 
-def make_function_call(call_id: str, name: str, arguments: str) -> SimpleNamespace:
+def function_call_item(
+    call_id: str = "call_test",
+    name: str = "calculate",
+    arguments: str = '{"expression": "(128 * 37 + 9) / 5"}',
+) -> SimpleNamespace:
     """模拟 Responses API 的 function_call 输出项。"""
     return SimpleNamespace(
         type="function_call",
@@ -18,22 +30,63 @@ def make_function_call(call_id: str, name: str, arguments: str) -> SimpleNamespa
     )
 
 
-def make_response(output: list | None = None, output_text: str = "") -> SimpleNamespace:
+def responses_response(
+    output: list | None = None,
+    output_text: str = "",
+    status: str = "completed",
+    error: Any = None,
+) -> SimpleNamespace:
     """模拟 Responses API 的 response 对象。"""
-    return SimpleNamespace(output=output or [], output_text=output_text)
+    return SimpleNamespace(
+        output=output or [],
+        output_text=output_text,
+        status=status,
+        error=error,
+    )
 
 
-def make_event(kind: str, **kwargs: Any) -> SimpleNamespace:
+def responses_event(kind: str, **kwargs: Any) -> SimpleNamespace:
     """模拟 Responses API 的流式事件。"""
-    obj = SimpleNamespace(type=kind)
-    for key, value in kwargs.items():
-        setattr(obj, key, value)
-    return obj
+    return SimpleNamespace(type=kind, **kwargs)
 
 
-def make_error(code: str, message: str) -> SimpleNamespace:
-    """模拟 Responses API 的 ResponseError。"""
-    return SimpleNamespace(code=code, message=message)
+def chat_tool_call(
+    call_id: str = "call_1",
+    name: str = "calculate",
+    arguments: str = '{"expression": "(128 * 37 + 9) / 5"}',
+) -> SimpleNamespace:
+    """模拟 Chat Completions 的 tool_call。"""
+    return SimpleNamespace(
+        id=call_id,
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def chat_response(
+    content: str | None = None,
+    tool_calls: list | None = None,
+    finish_reason: str = "stop",
+) -> SimpleNamespace:
+    """模拟 Chat Completions 的非流式响应。"""
+    message = SimpleNamespace(content=content, tool_calls=tool_calls)
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)]
+    )
+
+
+def chat_chunk(
+    content: str | None = None,
+    finish_reason: str | None = None,
+) -> SimpleNamespace:
+    """模拟 Chat Completions 的流式文本分片。"""
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content=content, tool_calls=None),
+                finish_reason=finish_reason,
+            )
+        ]
+    )
 
 
 class FakeResponses:
@@ -41,20 +94,35 @@ class FakeResponses:
 
     def __init__(self, responses: list) -> None:
         self._responses = responses
-        self.calls = 0
+        self.calls: list[dict[str, Any]] = []
 
     def create(self, **kwargs: Any) -> Any:
-        self.calls += 1
-        resp = self._responses[self.calls - 1]
-        if kwargs.get("stream"):
-            # 流式：resp 应该是一个 list of events
-            return iter(resp)
-        return resp
+        self.calls.append(kwargs)
+        response = self._responses[len(self.calls) - 1]
+        return iter(response) if kwargs.get("stream") else response
 
 
-class FakeClient:
+class FakeResponsesClient:
     def __init__(self, responses: list) -> None:
         self.responses = FakeResponses(responses)
+
+
+class FakeChatCompletions:
+    """模拟 client.chat.completions。"""
+
+    def __init__(self, responses: list) -> None:
+        self._responses = responses
+        self.calls: list[dict[str, Any]] = []
+
+    def create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        response = self._responses[len(self.calls) - 1]
+        return iter(response) if kwargs.get("stream") else response
+
+
+class FakeChatClient:
+    def __init__(self, responses: list) -> None:
+        self.chat = SimpleNamespace(completions=FakeChatCompletions(responses))
 
 
 class ToolTests(unittest.TestCase):
@@ -83,213 +151,297 @@ class ToolTests(unittest.TestCase):
         self.assertIn("utc_offset_seconds", result)
 
 
-class AgentLoopTests(unittest.TestCase):
+class AgentTurnTests(unittest.TestCase):
+    """A. run_agent_turn：规范化历史 + 两种 API 后端。"""
+
     def test_tool_call_is_executed_and_returned_to_model(self) -> None:
-        call = make_function_call("call_test", "calculate", json.dumps({"expression": "(128 * 37 + 9) / 5"}))
-        client = FakeClient(
+        call = function_call_item()
+        client = FakeResponsesClient(
             [
-                make_response([call], ""),
-                make_response([], "计算结果是 949"),
+                responses_response([call], ""),
+                responses_response([], "计算结果是 949"),
             ]
         )
         history: list[Any] = []
 
-        answer = agent.run_agent_turn(client, history, "请计算")
+        answer = agent.run_agent_turn(client, history, "请计算", style="responses")
 
         self.assertEqual(answer, "计算结果是 949")
-        self.assertEqual(client.responses.calls, 2)
-        outputs = [
-            item
-            for item in history
-            if isinstance(item, dict) and item.get("type") == "function_call_output"
-        ]
-        self.assertEqual(outputs[0]["call_id"], "call_test")
-        self.assertEqual(json.loads(outputs[0]["output"])["result"], 949.0)
+        self.assertEqual(len(client.responses.calls), 2)
 
+        # 历史是规范格式：assistant 带 tool_calls，工具结果单独一条。
+        self.assertEqual(history[0], {"role": "user", "content": "请计算"})
+        self.assertEqual(history[1]["role"], "assistant")
+        self.assertEqual(history[1]["tool_calls"][0]["id"], "call_test")
+        self.assertEqual(history[2]["role"], "tool")
+        self.assertEqual(history[2]["tool_call_id"], "call_test")
+        self.assertEqual(json.loads(history[2]["content"])["result"], 949.0)
 
-class CoreLoopTests(unittest.TestCase):
-    def test_agent_loop_with_injected_dependencies(self) -> None:
-        """agent_loop 不依赖全局配置：模型请求和工具执行都可以随意替换。"""
-        call = agent._make_tool_call("c1", "custom", json.dumps({"x": "a"}))
-        rounds = [
-            make_response([call], ""),
-            make_response([], "完成"),
-        ]
-        round_idx = [0]
+        # 第二次请求把工具调用和结果都回传给了模型。
+        second_input = client.responses.calls[1]["input"]
+        self.assertIn(
+            {
+                "type": "function_call",
+                "call_id": "call_test",
+                "name": "calculate",
+                "arguments": '{"expression": "(128 * 37 + 9) / 5"}',
+            },
+            second_input,
+        )
+        self.assertIn(
+            {
+                "type": "function_call_output",
+                "call_id": "call_test",
+                "output": history[2]["content"],
+            },
+            second_input,
+        )
 
-        def request_model() -> Any:
-            r = rounds[round_idx[0]]
-            round_idx[0] += 1
-            return r
-
-        def run_tool_call(call: Any) -> dict[str, Any]:
-            return {"ok": True, "result": 1}
-
+    def test_history_is_reused_across_turns(self) -> None:
+        client = FakeResponsesClient(
+            [
+                responses_response([], "第一轮回答"),
+                responses_response([], "第二轮回答"),
+            ]
+        )
         history: list[Any] = []
-        answer = agent.agent_loop(request_model, run_tool_call, history)
 
-        self.assertEqual(answer, "完成")
-        outputs = [
-            item
-            for item in history
-            if isinstance(item, dict) and item.get("type") == "function_call_output"
-        ]
-        self.assertEqual(outputs[0]["call_id"], "c1")
+        first = agent.run_agent_turn(client, history, "第一问", style="responses")
+        second = agent.run_agent_turn(client, history, "第二问", style="responses")
 
-    def test_agent_loop_raises_after_max_steps(self) -> None:
-        def request_model() -> Any:
-            call = make_function_call("x", "t", "{}")
-            return make_response([call], "")
+        self.assertEqual(first, "第一轮回答")
+        self.assertEqual(second, "第二轮回答")
 
-        with self.assertRaises(RuntimeError):
-            agent.agent_loop(request_model, lambda call: {"ok": True}, [], max_steps=2)
+        second_input = client.responses.calls[1]["input"]
+        self.assertIn({"role": "user", "content": "第一问"}, second_input)
+        self.assertIn({"role": "assistant", "content": "第一轮回答"}, second_input)
+        self.assertIn({"role": "user", "content": "第二问"}, second_input)
 
-    def test_agent_loop_raises_on_failed_response(self) -> None:
-        """HTTP 200 但 status=failed 时，SDK 不抛异常，这里要主动报错。
+    def test_malformed_tool_arguments_are_sent_back_to_model(self) -> None:
+        """参数不是合法 JSON 时，错误要作为工具结果回传，而不是直接崩掉。"""
+        bad_call = function_call_item(arguments="not json")
+        client = FakeResponsesClient(
+            [
+                responses_response([bad_call], ""),
+                responses_response([], "参数格式不对"),
+            ]
+        )
+        history: list[Any] = []
 
-        不检查的话会拿到空 output，看起来像"模型什么都没说"。
-        """
-        failed = SimpleNamespace(
-            output=[],
-            output_text="",
+        answer = agent.run_agent_turn(client, history, "算一下", style="responses")
+
+        self.assertEqual(answer, "参数格式不对")
+        tool_message = [m for m in history if m["role"] == "tool"][0]
+        payload = json.loads(tool_message["content"])
+        self.assertFalse(payload["ok"])
+        self.assertIn("参数解析失败", payload["error"])
+
+    def test_chat_style_end_to_end(self) -> None:
+        """同一个循环换成 Chat Completions 后端，行为保持一致。"""
+        client = FakeChatClient(
+            [
+                chat_response(tool_calls=[chat_tool_call()]),
+                chat_response(content="计算结果是 949"),
+            ]
+        )
+        history: list[Any] = []
+
+        answer = agent.run_agent_turn(client, history, "请计算", style="chat")
+
+        self.assertEqual(answer, "计算结果是 949")
+
+        second_messages = client.chat.completions.calls[1]["messages"]
+        self.assertEqual(second_messages[0]["role"], "system")
+        self.assertEqual(second_messages[1], {"role": "user", "content": "请计算"})
+        self.assertTrue(
+            any(
+                m.get("role") == "assistant" and m.get("tool_calls")
+                for m in second_messages
+            )
+        )
+        self.assertTrue(
+            any(
+                m.get("role") == "tool" and m.get("tool_call_id") == "call_1"
+                for m in second_messages
+            )
+        )
+
+    def test_failed_turn_rolls_back_history(self) -> None:
+        failed = responses_response(
             status="failed",
             error=SimpleNamespace(code="server_error", message="上游挂了"),
         )
+        client = FakeResponsesClient([failed])
+        history: list[Any] = []
 
-        def request_model() -> Any:
-            return failed
+        with self.assertRaises(RuntimeError):
+            agent.run_agent_turn(client, history, "你好", style="responses")
 
-        with self.assertRaises(RuntimeError) as ctx:
-            agent.agent_loop(request_model, lambda call: {"ok": True}, [])
+        self.assertEqual(history, [])
 
-        message = str(ctx.exception)
-        self.assertIn("server_error", message)
-        self.assertIn("上游挂了", message)
+
+class CoreLoopTests(unittest.TestCase):
+    """B. agent_loop：只依赖注入的 request / run_tool_call。"""
+
+    def test_agent_loop_with_injected_dependencies(self) -> None:
+        turns = [
+            agent.Turn(tool_calls=[agent.ToolCall("c1", "custom", '{"x": "a"}')]),
+            agent.Turn("完成"),
+        ]
+
+        def request() -> agent.Turn:
+            return turns.pop(0)
+
+        def run_tool_call(call: agent.ToolCall) -> dict[str, Any]:
+            return {"ok": True, "result": 1}
+
+        history: list[Any] = []
+        answer = agent.agent_loop(request, run_tool_call, history)
+
+        self.assertEqual(answer, "完成")
+        self.assertEqual(history[0]["role"], "assistant")
+        self.assertEqual(history[0]["tool_calls"][0]["id"], "c1")
+        self.assertEqual(history[1]["role"], "tool")
+        self.assertEqual(history[1]["tool_call_id"], "c1")
+
+    def test_agent_loop_returns_text_without_tools(self) -> None:
+        history: list[Any] = []
+
+        answer = agent.agent_loop(
+            lambda: agent.Turn("直接回答"), lambda call: {}, history
+        )
+
+        self.assertEqual(answer, "直接回答")
+        self.assertEqual(history, [{"role": "assistant", "content": "直接回答"}])
+
+    def test_agent_loop_raises_after_max_steps(self) -> None:
+        def request() -> agent.Turn:
+            return agent.Turn(tool_calls=[agent.ToolCall("x", "t", "{}")])
+
+        with self.assertRaises(RuntimeError):
+            agent.agent_loop(request, lambda call: {"ok": True}, [], max_steps=2)
 
 
 class StreamingLoopTests(unittest.TestCase):
-    """流式核心循环。"""
+    """C. agent_loop_stream：消费规范化流式事件。"""
 
     def test_stream_yields_text_incrementally(self) -> None:
         events = [
-            make_event("response.output_text.delta", delta="你"),
-            make_event("response.output_text.delta", delta="好"),
-            make_event("response.completed", response=make_response([], "你好")),
+            agent.TextDelta("你"),
+            agent.TextDelta("好"),
+            agent.Completed(agent.Turn("你好")),
         ]
         history: list[Any] = []
 
-        result = list(
+        chunks = list(
             agent.agent_loop_stream(
                 lambda: iter(events),
-                lambda c: {},
+                lambda call: {},
                 history,
             )
         )
 
-        self.assertEqual(result, ["你", "好"])
+        self.assertEqual(chunks, ["你", "好"])
+        self.assertEqual(history, [{"role": "assistant", "content": "你好"}])
 
     def test_stream_executes_tool_then_continues(self) -> None:
-        call = make_function_call("c1", "calculate", '{"expression": "1 + 1"}')
-        round1 = [
-            make_event("response.completed", response=make_response([call], "")),
+        rounds = [
+            [
+                agent.Completed(
+                    agent.Turn(
+                        tool_calls=[
+                            agent.ToolCall("c1", "calculate", '{"expression": "1 + 1"}')
+                        ]
+                    )
+                )
+            ],
+            [
+                agent.TextDelta("结果是 2"),
+                agent.Completed(agent.Turn("结果是 2")),
+            ],
         ]
-        round2 = [
-            make_event("response.output_text.delta", delta="结果是 2"),
-            make_event("response.completed", response=make_response([], "结果是 2")),
-        ]
-        rounds = [round1, round2]
         round_idx = [0]
 
         def request_stream() -> Any:
-            r = rounds[round_idx[0]]
+            events = rounds[round_idx[0]]
             round_idx[0] += 1
-            return iter(r)
+            return iter(events)
 
         history: list[Any] = []
         chunks = list(
             agent.agent_loop_stream(
-                request_stream, lambda c: {"ok": True, "result": 2}, history
+                request_stream, lambda call: {"ok": True, "result": 2}, history
             )
         )
 
         self.assertEqual("".join(chunks), "结果是 2")
-        outputs = [
-            item
-            for item in history
-            if isinstance(item, dict) and item.get("type") == "function_call_output"
-        ]
-        self.assertEqual(outputs[0]["call_id"], "c1")
+        self.assertEqual(history[0]["tool_calls"][0]["id"], "c1")
+        self.assertEqual(history[1]["role"], "tool")
+        self.assertEqual(history[1]["tool_call_id"], "c1")
 
-    def test_stream_raises_after_max_steps(self) -> None:
-        def request_stream() -> Any:
-            call = make_function_call("x", "t", "{}")
-            return iter([make_event("response.completed", response=make_response([call], ""))])
-
-        with self.assertRaises(RuntimeError):
-            list(agent.agent_loop_stream(request_stream, lambda c: {}, [], max_steps=2))
-
-    def test_stream_raises_with_real_reason_on_failed_response(self) -> None:
-        """response.failed 必须报出真实原因，而不是"未返回最终结果"。"""
-        failed_response = SimpleNamespace(
-            output=[],
-            output_text="",
-            status="failed",
-            error=make_error("server_error", "上游模型过载"),
-        )
-
-        def request_stream() -> Any:
-            return iter(
-                [
-                    make_event("response.output_text.delta", delta="开头"),
-                    make_event("response.failed", response=failed_response),
-                ]
+    def test_stream_raises_on_failure_event(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            list(
+                agent.agent_loop_stream(
+                    lambda: iter([agent.Failed("限流了")]), lambda call: {}, []
+                )
             )
-
-        with self.assertRaises(RuntimeError) as ctx:
-            list(agent.agent_loop_stream(request_stream, lambda c: {}, []))
-
-        message = str(ctx.exception)
-        self.assertIn("server_error", message)
-        self.assertIn("上游模型过载", message)
-
-    def test_stream_raises_on_incomplete_response(self) -> None:
-        """response.incomplete（比如输出被 max_output_tokens 截断）也要报错。"""
-        incomplete = SimpleNamespace(
-            output=[],
-            output_text="",
-            status="incomplete",
-            error=make_error("max_output_tokens", "输出被截断"),
-        )
-
-        def request_stream() -> Any:
-            return iter([make_event("response.incomplete", response=incomplete)])
-
-        with self.assertRaises(RuntimeError) as ctx:
-            list(agent.agent_loop_stream(request_stream, lambda c: {}, []))
-
-        self.assertIn("输出被截断", str(ctx.exception))
-
-    def test_stream_raises_on_gateway_error_event(self) -> None:
-        """网关直接下发 error 事件时也要报出信息。"""
-        def request_stream() -> Any:
-            return iter(
-                [make_event("error", code="rate_limit_exceeded", message="限流了")]
-            )
-
-        with self.assertRaises(RuntimeError) as ctx:
-            list(agent.agent_loop_stream(request_stream, lambda c: {}, []))
 
         self.assertIn("限流了", str(ctx.exception))
 
     def test_stream_raises_when_completed_event_missing(self) -> None:
-        """整条流没有 response.completed 事件时，错误信息要说清是缺事件。"""
-        def request_stream() -> Any:
-            return iter([make_event("response.output_text.delta", delta="只有文字")])
-
         with self.assertRaises(RuntimeError) as ctx:
-            list(agent.agent_loop_stream(request_stream, lambda c: {}, []))
+            list(
+                agent.agent_loop_stream(
+                    lambda: iter([agent.TextDelta("只有文字")]), lambda call: {}, []
+                )
+            )
 
-        self.assertIn("response.completed", str(ctx.exception))
+        self.assertIn("完成事件", str(ctx.exception))
+
+    def test_stream_raises_after_max_steps(self) -> None:
+        def request_stream() -> Any:
+            return iter(
+                [
+                    agent.Completed(
+                        agent.Turn(tool_calls=[agent.ToolCall("x", "t", "{}")])
+                    )
+                ]
+            )
+
+        with self.assertRaises(RuntimeError):
+            list(agent.agent_loop_stream(request_stream, lambda call: {}, [], max_steps=2))
+
+    def test_chat_style_stream_end_to_end(self) -> None:
+        client = FakeChatClient(
+            [[chat_chunk(content="结果"), chat_chunk(content="是 2", finish_reason="stop")]]
+        )
+        history: list[Any] = []
+
+        text = "".join(
+            agent.run_agent_turn_stream(client, history, "1+1", style="chat")
+        )
+
+        self.assertEqual(text, "结果是 2")
+        self.assertEqual(history[0], {"role": "user", "content": "1+1"})
+        self.assertEqual(history[1], {"role": "assistant", "content": "结果是 2"})
+
+    def test_failed_stream_rolls_back_history(self) -> None:
+        failed = responses_response(
+            status="failed",
+            error=SimpleNamespace(code="server_error", message="上游挂了"),
+        )
+        events = [
+            responses_event("response.output_text.delta", delta="开头"),
+            responses_event("response.failed", response=failed),
+        ]
+        client = FakeResponsesClient([events])
+        history: list[Any] = []
+
+        with self.assertRaises(RuntimeError):
+            list(agent.run_agent_turn_stream(client, history, "你好", style="responses"))
+
+        self.assertEqual(history, [])
 
 
 if __name__ == "__main__":

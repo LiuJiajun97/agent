@@ -20,6 +20,14 @@ if load_dotenv is not None:
 # 可在 .env 中用 OPENAI_MODEL 覆盖。
 MODEL = os.getenv("OPENAI_MODEL", "MiniMax-M3.1-Flash")
 
+# API 风格：responses（默认）或 chat。
+# 统一在这里读取并校验，避免各模块各自解析环境变量。
+API_STYLE = os.getenv("OPENAI_API_STYLE", "responses").strip().lower()
+if API_STYLE not in ("responses", "chat"):
+    raise ValueError(
+        f"OPENAI_API_STYLE 只能是 responses 或 chat，当前为 {API_STYLE!r}"
+    )
+
 # 模型请求次数上限，防止无限调用工具和持续产生费用。
 MAX_STEPS = 8
 

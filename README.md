@@ -14,11 +14,13 @@ Python 执行工具
 最终回答
 ```
 
-项目使用 OpenAI **Responses API**（`/v1/responses`）与 Function Calling，
+项目默认使用 OpenAI **Responses API**（`/v1/responses`）与 Function Calling，
+也可以通过 `OPENAI_API_STYLE=chat` 切到 **Chat Completions**（`/v1/chat/completions`）。
+两种 API 的差异收敛在 `agent/backends.py`，Agent 循环本身不做区分。
 包含安全的算术工具、当前时间工具、多轮对话与自动化测试。
 
-三套实现（手写版、LangChain 版、LangGraph 原生版）走**同一条** API 路径，
-可以直接横向对比。
+三套实现（手写版、LangChain 版、LangGraph 原生版）默认走**同一条** API 路径，
+切到 chat 模式时也会同步切换，可以直接横向对比。
 
 同时提供两套框架实现与手写版**三方并列**：
 
@@ -38,8 +40,9 @@ agent/
 ├── .gitignore
 ├── agent/                  # 手写版（不使用 Agent 框架）
 │   ├── __init__.py         # 包说明 + 统一导出公共 API
-│   ├── config.py           # 环境变量加载、模型名、最大步数、系统指令
+│   ├── config.py           # 环境变量加载、模型名、API 风格、最大步数、系统指令
 │   ├── tools.py            # TOOLS 清单 + calculate / get_current_time / execute_tool
+│   ├── backends.py         # API 适配层：Responses / Chat Completions 两种后端
 │   ├── loop.py             # agent_loop 核心循环 + run_agent_turn 单轮封装（含流式版）
 │   └── cli.py              # main 命令行入口（单次问答 + 交互 REPL）
 ├── agent_lc/               # LangChain 版（create_agent 封装）
@@ -57,7 +60,8 @@ agent/
 ├── requirements.txt        # 便于直接安装的依赖清单
 └── tests/
     ├── __init__.py
-    ├── test_agent.py       # 手写版测试
+    ├── test_agent.py       # 手写版循环测试
+    ├── test_backends.py    # 两种 API 适配层测试
     ├── test_lc.py          # LangChain 版测试
     └── test_lg.py          # LangGraph 原生版测试
 ```
@@ -80,7 +84,7 @@ python -m venv .venv
 
 不要向 uv 管理的全局 Python 安装依赖，也不要使用 `--break-system-packages`。
 
-依赖包含两套实现的全部需要：`openai`（手写版）、`langchain` / `langchain-openai` / `langgraph`（LangChain 版）。
+依赖包含三套实现的全部需要：`openai`（手写版）、`langchain` / `langchain-openai` / `langgraph`（两个框架版）。
 
 ## 2. 配置 API Key
 
@@ -95,7 +99,13 @@ Copy-Item .env.example .env
 ```dotenv
 OPENAI_API_KEY=你的 API Key
 OPENAI_MODEL=MiniMax-M3.1-Flash
+
+# API 风格：responses（默认）或 chat
+OPENAI_API_STYLE=responses
 ```
+
+如果网关只支持 Chat Completions，把 `OPENAI_API_STYLE` 改成 `chat`；
+手写版和两个框架版会一起切换。
 
 使用兼容 OpenAI 的网关时，取消注释并填写：
 
@@ -177,7 +187,8 @@ minimal-agent-lg "你好"      # LangGraph 原生版
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-共 50 个测试：`test_agent.py` 覆盖手写版，`test_lc.py` 覆盖 LangChain 版，`test_lg.py` 覆盖 LangGraph 原生版。
+共 72 个测试：`test_agent.py` 覆盖手写版循环，`test_backends.py` 覆盖两种 API 适配器，
+`test_lc.py` 覆盖 LangChain 版，`test_lg.py` 覆盖 LangGraph 原生版。
 测试均不调用真实 API，不需要 API Key。
 
 ## 6. 核心循环
@@ -186,25 +197,27 @@ minimal-agent-lg "你好"      # LangGraph 原生版
 
 ```python
 for _ in range(max_steps):
-    response = request_model()      # 请求模型
-    history.extend(response.output)  # 记录本轮输出
+    turn = request()                 # 请求模型，返回 Turn
+    history.append(...)              # 记录 assistant 输出
+    if not turn.tool_calls:          # 没有工具调用 = 模型答完了
+        return turn.text
 
-    tool_calls = [i for i in response.output if i.type == "function_call"]
-    if not tool_calls:               # 没有工具调用 = 模型答完了
-        return response.output_text
-
-    for call in tool_calls:          # 执行工具并回传结果
+    for call in turn.tool_calls:     # 执行工具并回传结果
         result = run_tool_call(call)
         history.append({
-            "type": "function_call_output",
-            "call_id": call.call_id,
-            "output": json.dumps(result, ensure_ascii=False),
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": json.dumps(result, ensure_ascii=False),
         })
 ```
 
-`run_agent_turn()` 只是薄封装：把 `MODEL` / `SYSTEM_PROMPT` / `TOOLS` 和 API 客户端包装成上面两个可调用对象，并负责出错时回滚历史。
+`run_agent_turn()` 只是薄封装：根据 `OPENAI_API_STYLE` 选择后端（`build_backend`），
+把 `MODEL` / `SYSTEM_PROMPT` / `TOOLS` 交给后端，并负责出错时回滚历史。
 
-如果没有工具调用，`response.output_text` 就是最终回答；否则把工具结果追加到历史，再次请求模型，直到模型给出最终回答或达到最大轮数。
+历史使用厂商无关的规范格式：`user`、`assistant`（可带 `tool_calls`）、`tool`。
+发给模型前由 `agent/backends.py` 转换成对应 API 的消息结构。
+
+如果没有工具调用，`turn.text` 就是最终回答；否则把工具结果追加到历史，再次请求模型，直到模型给出最终回答或达到最大轮数。
 
 ## 7. 添加工具
 
@@ -213,7 +226,8 @@ for _ in range(max_steps):
 1. 在 `TOOLS` 中增加 JSON Schema。
 2. 在 `execute_tool()` 中增加同名处理分支。
 
-`TOOLS` 用的是 Responses API 的**扁平**格式，`name` / `description` / `parameters` 直接挂在顶层：
+`TOOLS` 用的是 Responses API 的**扁平**格式，`name` / `description` / `parameters` 直接挂在顶层。
+Chat Completions 需要的嵌套格式由 `to_chat_tools()` 自动转换，新增工具时不用写两份：
 
 ```python
 {
@@ -231,7 +245,7 @@ for _ in range(max_steps):
 
 ## 8. 框架对照版
 
-项目里有三套实现，跑同一个模型、同一套工具、同一份系统提示词，可以直接横向对比。
+项目里有三套实现，跑同一个模型、同一套工具、同一份系统提示词和同一个 API 风格，可以直接横向对比。
 
 ### 8.1 LangChain 版（`agent_lc/`）
 
@@ -248,18 +262,21 @@ agent = create_agent(
 )
 ```
 
-模型客户端这样构造，指定走 Responses API：
+默认走 Responses API 时，模型客户端这样构造：
 
 ```python
 model = ChatOpenAI(
     model=MODEL,
     api_key=os.getenv("OPENAI_API_KEY"),
     base_url=os.getenv("OPENAI_BASE_URL") or None,
-    use_responses_api=True,        # 走 /v1/responses
-    output_version="responses/v1", # content 用内容块列表格式
+    use_responses_api=True,        # chat 模式下为 False
+    output_version="responses/v1", # 仅 Responses 模式设置
     streaming=True,
 )
 ```
+
+`agent_lc/graph.py` 会把这两项都交给 `OPENAI_API_STYLE` 决定：
+chat 模式下 `use_responses_api=False`，也不再设置 `output_version`。
 
 多轮记忆由 checkpointer 按 `thread_id` 自动维护，每次只需传入本轮消息：
 
@@ -326,7 +343,7 @@ def route_after_model(state: AgentState) -> str:
 | 多轮记忆 | 手工维护 `history` 列表 | `InMemorySaver` + `thread_id` | 同 LangChain 版 |
 | 步数上限 | `MAX_STEPS = 8`（模型请求数） | `recursion_limit = 16`（图超级步） | 同 LangChain 版 |
 | 工具错误回传 | 显式包装成 `{"ok": False, ...}` | 同左 | 同左 |
-| 走的 API 路径 | Responses API `/v1/responses` | Responses API `/v1/responses` | 同 LangChain 版 |
+| 走的 API 路径 | 默认 `/v1/responses`，可切 `/v1/chat/completions` | 同左 | 同左 |
 | 命令 | `minimal-agent` | `minimal-agent-lc` | `minimal-agent-lg` |
 
 三套实现生成的图结构完全一致，都是：
@@ -338,7 +355,7 @@ model     -> tools      (条件边)
 tools     -> model      (回边)
 ```
 
-### 8.4 两处有意的行为差异
+### 8.4 三处有意的行为差异
 
 1. **步数上限是近似对齐**：LangGraph 的 `recursion_limit` 计数的是「图超级步」（一次模型请求 + 一次工具执行约 2 步），而 `MAX_STEPS` 语义是「模型请求次数」，所以取 `MAX_STEPS * 2 = 16`，两边大致相当但非严格等价。另外 `create_agent` 自己默认把 `recursion_limit` 设成 9999，所以框架版必须显式传值才能保住成本上限。
 2. **工具结果格式**：手写版用 `json.dumps(result, ensure_ascii=False)`，框架版由 `ToolNode` 序列化。两者都是 JSON 文本，结构一致。
@@ -368,7 +385,8 @@ for chunk in run_turn_stream(client, history, "讲个笑话"):
 
 ```python
 stream = client.responses.create(
-    model=MODEL, instructions=SYSTEM_PROMPT, input=history, tools=TOOLS, stream=True,
+    model=MODEL, instructions=SYSTEM_PROMPT,
+    input=to_responses_input(history), tools=TOOLS, stream=True,
 )
 for event in stream:
     if event.type == "response.output_text.delta":
@@ -376,6 +394,8 @@ for event in stream:
     elif event.type == "response.completed":
         final_response = event.response   # 完整响应，含 output
 ```
+
+以上逻辑现在位于 `agent/backends.py` 的 `ResponsesBackend.request_stream()`。
 
 Responses API 的流式事件是**结构化**的：文本增量和工具调用分属不同事件类型，
 不需要像 Chat Completions 那样自己累积 `delta.tool_calls` 分片。
@@ -392,7 +412,7 @@ Responses API 的流式事件是**结构化**的：文本增量和工具调用�
 **失败事件必须单独处理**：SDK 只在 HTTP 错误码时抛异常，
 `HTTP 200 + status=failed` 会正常返回一个 `output` 为空的响应。
 不检查的话会拿到空回答，看起来像"模型什么都没说"。
-`agent/loop.py` 的 `_raise_if_failed()`（非流式）和 `_describe_failure()`（流式）负责这件事。
+`agent/backends.py` 的 `_raise_if_failed()`（非流式）和 `_describe_failure()`（流式）负责这件事。
 
 注意：**工具调用的执行时机没变**——仍然等本轮模型输出收齐后才执行工具，再继续下一轮。
 所以流式只会加速"文字出现"的速度，不会让工具提前执行。
@@ -421,13 +441,17 @@ if not isinstance(chunk, AIMessageChunk):
 
 LangGraph 还有其他模式：`"updates"`（按节点汇报）、`"values"`（每步完整状态）。
 
+切到 Chat Completions 时，手写版由 `ChatCompletionsBackend` 累积 `delta.content`
+和分片的 `delta.tool_calls`；框架版仍由 LangChain 内部处理，
+`message_text()` 已经同时兼容字符串和内容块列表两种 content。
+
 ### 9.3 三套实现对照
 
 | 维度 | 手写版 | LangChain 版 | LangGraph 原生版 |
 |---|---|---|---|
-| 底层接口 | `client.responses.create(stream=True)` | `graph.stream()` | `graph.stream()` |
-| API 端点 | `/v1/responses` | `/v1/responses` | `/v1/responses` |
-| 事件来源 | `response.output_text.delta` 等结构化事件 | `AIMessageChunk` | `AIMessageChunk` |
+| 底层接口 | 后端内 `responses` / `chat.completions` 的流式接口 | `graph.stream()` | `graph.stream()` |
+| API 端点 | 默认 `/v1/responses`，可切 `/v1/chat/completions` | 同左 | 同左 |
+| 事件来源 | Responses 结构化事件 / Chat 的 `delta` 分片 | `AIMessageChunk` | `AIMessageChunk` |
 | 提取纯文本 | 事件自带 `.delta` | `message_text()`（content 是块列表） | `message_text()`（content 是块列表） |
 | 过滤工具结果 | 只 yield 文本增量事件，工具结果天然不进来 | `isinstance` 判断 | `isinstance` 判断 |
 | 模型需流式 | 不需要（stream 模式自带） | `ChatOpenAI(streaming=True)` | `ChatOpenAI(streaming=True)` |
@@ -437,6 +461,47 @@ LangGraph 还有其他模式：`"updates"`（按节点汇报）、`"values"`（�
 
 框架版的 `run_turn()`（非流式）**没有**改成流式的收集版，仍走 `invoke()` 取最后一条消息。
 原因是流式会把中间轮的模型文本也吐出来，与“只要最终回答”的语义不一致。
+
+## 10. 双 API 支持
+
+### 10.1 切换方式
+
+在 `.env` 里设置：
+
+```dotenv
+OPENAI_API_STYLE=responses   # 默认，走 /v1/responses
+# OPENAI_API_STYLE=chat      # 走 /v1/chat/completions
+```
+
+三套实现共用这个开关：手写版通过 `build_backend()` 选择适配器，
+两个框架版把它映射成 `ChatOpenAI(use_responses_api=...)`。
+
+### 10.2 适配层结构
+
+`agent/backends.py` 把两种 API 的差异收敛成统一契约：
+
+- `Turn` / `ToolCall`：模型一轮输出（文本 + 工具调用）。
+- `TextDelta` / `Completed` / `Failed`：流式事件。
+- 规范历史：`user` / `assistant`（可带 `tool_calls`）/ `tool`。
+
+循环只消费这些统一结构，代码里不出现任何 API 专属字段。
+
+| 差异点 | Responses 适配器 | Chat Completions 适配器 |
+|---|---|---|
+| 端点 | `client.responses.create` | `client.chat.completions.create` |
+| 系统提示 | `instructions=` | 消息列表首条 `system` |
+| 工具 schema | 扁平 `name` / `parameters` | 嵌套 `function: {name, parameters}` |
+| 工具调用 | `function_call` item + `call_id` | `message.tool_calls[].function` |
+| 工具结果 | `function_call_output` item | `role=tool` + `tool_call_id` |
+| 流式文本 | `response.output_text.delta` | `delta.content` |
+| 流式工具调用 | 结构化 item，直接可取 | 按 `index` 累积 `delta.tool_calls` |
+| 失败信号 | `response.failed` / `incomplete` | HTTP 异常 + `finish_reason=length` |
+
+### 10.3 约束
+
+- 不做自动探测：配置错误直接报错，而不是偷偷回退到另一种 API。
+- 新增工具仍然只改 `TOOLS` 和 `execute_tool()`，Chat 格式由适配层转换。
+- 两种模式使用同一套规范历史，切换 API 不需要清空已有上下文。
 
 ## 官方文档
 

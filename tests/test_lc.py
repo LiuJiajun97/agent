@@ -159,11 +159,17 @@ class GraphTests(unittest.TestCase):
         agent = agent_lc.build_agent(model=model)
         self.assertTrue(hasattr(agent, "invoke"))
 
-    def test_build_model_uses_responses_api(self) -> None:
-        """框架版必须走 Responses API，才能和手写版对照同一端点。"""
+    def test_build_model_defaults_to_responses_api(self) -> None:
+        """默认走 Responses API，才能和手写版对照同一端点。"""
         model = agent_lc.build_model()
         self.assertTrue(getattr(model, "use_responses_api", False))
         self.assertEqual(getattr(model, "output_version", None), "responses/v1")
+
+    def test_build_model_can_use_chat_completions(self) -> None:
+        """切到 chat 时不再走 Responses，也不设置 Responses 专属的 output_version。"""
+        model = agent_lc.build_model(api_style="chat")
+        self.assertFalse(getattr(model, "use_responses_api", True))
+        self.assertNotEqual(getattr(model, "output_version", None), "responses/v1")
 
 
 class EndToEndTests(unittest.TestCase):

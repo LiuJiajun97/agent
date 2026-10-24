@@ -14,7 +14,7 @@ import operator
 from datetime import datetime
 from typing import Any
 
-# 工具清单：Chat Completions API 格式。
+# 工具清单：Responses API 格式。
 # 模型只能看到名称、描述和参数结构，真正的代码由我们自己执行。
 # Responses API 的工具格式是"扁平"的：name / description / parameters 直接挂在顶层，
 # 而不是嵌套在 function 字段下（那是 Chat Completions 的格式）。
