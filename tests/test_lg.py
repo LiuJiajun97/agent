@@ -132,7 +132,7 @@ class GraphShapeTests(unittest.TestCase):
 
     def test_tool_names_match_handwritten_version(self) -> None:
         """三套实现的工具集必须等价，否则对照实验不成立。"""
-        handwritten = [t["function"]["name"] for t in agent.tools.TOOLS]
+        handwritten = [t["name"] for t in agent.tools.TOOLS]
         self.assertEqual([t.name for t in agent_lg.build_tools()], handwritten)
 
 

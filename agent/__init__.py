@@ -23,7 +23,6 @@ __all__ = [
     "MODEL",
     "SYSTEM_PROMPT",
     "TOOLS",
-    "StreamEvent",
     "agent_loop",
     "agent_loop_stream",
     "calculate",

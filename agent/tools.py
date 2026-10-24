@@ -16,39 +16,34 @@ from typing import Any
 
 # 工具清单：Chat Completions API 格式。
 # 模型只能看到名称、描述和参数结构，真正的代码由我们自己执行。
+# Responses API 的工具格式是"扁平"的：name / description / parameters 直接挂在顶层，
+# 而不是嵌套在 function 字段下（那是 Chat Completions 的格式）。
 TOOLS = [
     {
         "type": "function",
-        "function": {
-            "name": "calculate",
-            # description 写得越清楚，模型调用时机判断越准。
-            "description": "安全地计算一个数学表达式，例如 (128 * 37 + 9) / 5。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "只包含数字、括号和 + - * / // % ** 运算符的表达式。",
-                    }
-                },
-                "required": ["expression"],
-                # False 表示模型不能传入未声明的参数。
-                "additionalProperties": False,
+        "name": "calculate",
+        "description": "安全地计算一个数学表达式，例如 (128 * 37 + 9) / 5。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "只包含数字、括号和 + - * / // % ** 运算符的表达式。",
+                }
             },
+            "required": ["expression"],
+            "additionalProperties": False,
         },
     },
     {
         "type": "function",
-        "function": {
-            "name": "get_current_time",
-            "description": "获取运行该程序的计算机当前本地日期和时间。",
-            # 无参工具：properties 和 required 都是空。
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": False,
-            },
+        "name": "get_current_time",
+        "description": "获取运行该程序的计算机当前本地日期和时间。",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
         },
     },
 ]

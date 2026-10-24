@@ -12,6 +12,14 @@ from agent.loop import run_agent_turn, run_agent_turn_stream
 
 def main() -> None:
     """命令行入口：单次问答 + 交互式 REPL。"""
+    # Windows 控制台默认编码可能不是 UTF-8，统一重配置避免中文输出报错。
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8")
+            except (ValueError, OSError):
+                pass
     # 放在函数内导入，测试导入本包时不必初始化 API 客户端。
     try:
         from openai import OpenAI

@@ -10,28 +10,78 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from agent.config import MAX_STEPS, MODEL, SYSTEM_PROMPT
 from agent.tools import TOOLS, execute_tool
 
 
+def _raise_if_failed(response: Any) -> None:
+    """非流式响应如果状态是 failed / incomplete，抛出带真实原因的异常。
+
+    SDK 只在 HTTP 错误码时抛异常；HTTP 200 + status=failed 时会正常返回，
+    不检查的话会拿到一个空 output，看起来像"模型什么都没说"。
+    """
+    status = getattr(response, "status", None)
+    if status not in ("failed", "incomplete"):
+        return
+
+    error = getattr(response, "error", None)
+    code = getattr(error, "code", None) if error is not None else None
+    message = getattr(error, "message", None) if error is not None else None
+
+    parts = [f"模型响应未成功完成（status={status}）"]
+    if code:
+        parts.append(f"code={code}")
+    if message:
+        parts.append(message)
+    raise RuntimeError("，".join(parts))
+
+
+def _describe_failure(event: Any) -> str:
+    """把失败事件翻译成一句人能看懂的错误信息。
+
+    Responses API 有两种失败信号：
+    - response.failed / response.incomplete：事件里带 .response，
+      真正的错误在 response.error（.code / .message）。
+    - error：网关直接下发的错误事件，错误信息就在事件自身。
+    """
+    kind = getattr(event, "type", "unknown")
+
+    response = getattr(event, "response", None)
+    error = getattr(response, "error", None) if response is not None else None
+
+    if error is None:
+        error = event if kind == "error" else None
+
+    if error is None:
+        return f"流式响应失败（事件类型: {kind}）"
+
+    code = getattr(error, "code", None)
+    message = getattr(error, "message", None) or "（无详细信息）"
+
+    parts = [f"流式响应失败（{kind}）"]
+    if code:
+        parts.append(f"code={code}")
+    parts.append(message)
+    return "，".join(parts)
+
+
 def _tool_result_for(call: Any) -> dict[str, Any]:
     """执行单个工具调用，返回可回传给模型的结果字典。
 
-    call 是 Chat Completions 的 tool_call 对象，
-    有 .id / .function.name / .function.arguments（JSON 字符串）。
+    call 是 Responses API 的 function_call 输出项，
+    有 .name / .arguments（JSON 字符串）/ .call_id。
     """
     try:
-        arguments = json.loads(call.function.arguments or "{}")
+        arguments = json.loads(getattr(call, "arguments", None) or "{}")
         if not isinstance(arguments, dict):
             raise ValueError("工具参数必须是 JSON 对象")
     except (json.JSONDecodeError, ValueError) as exc:
         # 参数格式错误也要回传给模型，让它有机会修正。
         return {"ok": False, "error": f"参数解析失败: {exc}"}
 
-    return execute_tool(call.function.name, arguments)
+    return execute_tool(call.name, arguments)
 
 
 def agent_loop(
@@ -44,8 +94,8 @@ def agent_loop(
 
     不依赖任何全局配置，全部通过参数注入：
 
-    - request_model：无参可调用对象，返回一次 Chat Completions 响应。
-    - run_tool_call：接收单个 tool_call 项，返回结果字典。
+    - request_model：无参可调用对象，返回一次 Responses API 响应。
+    - run_tool_call：接收单个 function_call 项，返回结果字典。
     - history：对话历史，会被原地追加。
     - max_steps：最大模型请求次数，防止无限循环。
 
@@ -53,37 +103,27 @@ def agent_loop(
     """
     for _ in range(max_steps):
         response = request_model()
-        message = response.choices[0].message
 
-        # 追加 assistant 消息到历史。
-        assistant_msg: dict[str, Any] = {"role": "assistant", "content": message.content}
-        if message.tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in message.tool_calls
-            ]
-        history.append(assistant_msg)
+        # HTTP 200 但 status=failed/incomplete 的情况 SDK 不会抛异常，
+        # 这里主动检查，否则会把空回答当成正常结果返回。
+        _raise_if_failed(response)
 
-        # 没有工具调用 = 模型已经答完，直接返回。
-        if not message.tool_calls:
-            return message.content or "（模型没有返回文本）"
+        # Responses API 的输出是 item 列表，直接追加到历史。
+        history.extend(response.output)
 
-        for tc in message.tool_calls:
-            result = run_tool_call(tc)
+        tool_calls = [i for i in response.output if getattr(i, "type", None) == "function_call"]
+        if not tool_calls:
+            return response.output_text
 
-            # Chat Completions 的工具结果格式：role="tool" + tool_call_id。
+        for call in tool_calls:
+            result = run_tool_call(call)
+
+            # Responses API 的工具结果格式：function_call_output 项。
             history.append(
                 {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": json.dumps(result, ensure_ascii=False),
                 }
             )
 
@@ -106,9 +146,10 @@ def run_agent_turn(client: Any, history: list[Any], user_text: str) -> str:
 
     def request_model() -> Any:
         # 每次请求都是独立的，所以消息历史、工具清单都要完整传入。
-        return client.chat.completions.create(
+        return client.responses.create(
             model=MODEL,
-            messages=history,
+            instructions=SYSTEM_PROMPT,
+            input=history,
             tools=TOOLS,
         )
 
@@ -121,22 +162,6 @@ def run_agent_turn(client: Any, history: list[Any], user_text: str) -> str:
 
 
 # ---- 流式版本 ----
-
-
-@dataclass
-class StreamEvent:
-    """归一化后的流式事件。
-
-    Chat Completions 的流式 chunk 里，文本增量在 delta.content，
-    工具调用增量在 delta.tool_calls（分片，需要累积）。
-    """
-
-    # "text" 文本增量 / "tool_calls" 工具调用完成 / "final" 整轮响应结束
-    kind: str
-    # kind="text" 时的文本片段
-    text: str = ""
-    # kind="tool_calls" 时的 tool_call 列表（已累积完整）
-    tool_calls: list = field(default_factory=list)
 
 
 def agent_loop_stream(
@@ -152,68 +177,53 @@ def agent_loop_stream(
     2. 工具调用的执行时机不变——仍然等本轮模型的输出收齐后再执行。
     """
     for _ in range(max_steps):
-        # 累积器：index -> {id, name, arguments}
-        tool_calls_acc: dict[int, dict[str, str]] = {}
-        text_chunks: list[str] = []
+        final_response: Any = None
+        failure: str | None = None
 
-        for raw in request_stream():
-            delta = raw.choices[0].delta
-            if delta.content:
-                text_chunks.append(delta.content)
-                for ch in delta.content:
-                    yield ch
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in tool_calls_acc:
-                        tool_calls_acc[idx] = {
-                            "id": tc.id or "",
-                            "name": tc.function.name or "",
-                            "arguments": "",
-                        }
-                    if tc.id:
-                        tool_calls_acc[idx]["id"] = tc.id
-                    if tc.function.name:
-                        tool_calls_acc[idx]["name"] = tc.function.name
-                    if tc.function.arguments:
-                        tool_calls_acc[idx]["arguments"] += tc.function.arguments
+        for event in request_stream():
+            kind = getattr(event, "type", None)
 
-        # 构造 tool_calls 列表（模拟 Chat Completions 的 tool_call 对象）
-        accumulated_tool_calls = []
-        for idx in sorted(tool_calls_acc):
-            acc = tool_calls_acc[idx]
-            accumulated_tool_calls.append(
-                _make_tool_call(acc["id"], acc["name"], acc["arguments"])
-            )
+            if kind == "response.output_text.delta":
+                delta = getattr(event, "delta", "") or ""
+                if delta:
+                    yield delta
 
-        # 追加 assistant 消息到历史。
-        full_text = "".join(text_chunks)
-        assistant_msg: dict[str, Any] = {"role": "assistant", "content": full_text or None}
-        if accumulated_tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in accumulated_tool_calls
-            ]
-        history.append(assistant_msg)
+            elif kind == "response.completed":
+                # 正常收尾事件，带完整 response 对象。
+                final_response = getattr(event, "response", None)
 
-        # 没有工具调用 = 模型答完了。
-        if not accumulated_tool_calls:
+            elif kind in ("response.failed", "response.incomplete"):
+                # 模型侧失败或输出被截断，要把真实原因告诉调用方，
+                # 不能只报"流式响应未返回最终结果"。
+                failure = _describe_failure(event)
+
+            elif kind == "error":
+                # 网关级错误事件。
+                failure = _describe_failure(event)
+
+        if failure is not None:
+            raise RuntimeError(failure)
+
+        if final_response is None:
+            raise RuntimeError("流式响应未返回最终结果（缺少 response.completed 事件）")
+
+        history.extend(final_response.output)
+
+        tool_calls = [
+            i for i in final_response.output
+            if getattr(i, "type", None) == "function_call"
+        ]
+
+        if not tool_calls:
             return
 
-        for tc in accumulated_tool_calls:
-            result = run_tool_call(tc)
+        for call in tool_calls:
+            result = run_tool_call(call)
             history.append(
                 {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": json.dumps(result, ensure_ascii=False),
                 }
             )
 
@@ -222,24 +232,18 @@ def agent_loop_stream(
     raise RuntimeError(f"超过最大工具调用轮数 ({max_steps})")
 
 
-class _ToolCallFunction:
-    """模拟 Chat Completions tool_call.function 的命名空间。"""
+class _ToolCall:
+    """模拟 Responses API 的 function_call 输出项，供 _tool_result_for 使用。"""
 
-    def __init__(self, name: str, arguments: str):
+    def __init__(self, call_id: str, name: str, arguments: str):
+        self.call_id = call_id
         self.name = name
         self.arguments = arguments
+        self.type = "function_call"
 
 
-class _ToolCall:
-    """模拟 Chat Completions 的 tool_call 对象，供 _tool_result_for 使用。"""
-
-    def __init__(self, id: str, name: str, arguments: str):
-        self.id = id
-        self.function = _ToolCallFunction(name, arguments)
-
-
-def _make_tool_call(id: str, name: str, arguments: str) -> _ToolCall:
-    return _ToolCall(id, name, arguments)
+def _make_tool_call(call_id: str, name: str, arguments: str) -> _ToolCall:
+    return _ToolCall(call_id, name, arguments)
 
 
 def run_agent_turn_stream(
@@ -249,17 +253,16 @@ def run_agent_turn_stream(
 ) -> Iterator[str]:
     """流式执行一轮用户请求，逐段产出模型文本。
 
-    用的是 Chat Completions 的 stream 模式（client.chat.completions.create(stream=True)），
-    粒度比 Responses API 更细。
+    用的是 Responses API 的 stream 模式（client.responses.create(stream=True)）。
     """
-    # 与 run_agent_turn 一样：先记下起始位置，出错时回滚。
     history_start = len(history)
     history.append({"role": "user", "content": user_text})
 
     def request_stream() -> Any:
-        return client.chat.completions.create(
+        return client.responses.create(
             model=MODEL,
-            messages=history,
+            instructions=SYSTEM_PROMPT,
+            input=history,
             tools=TOOLS,
             stream=True,
         )

@@ -14,7 +14,8 @@ Python 执行工具
 最终回答
 ```
 
-项目使用 OpenAI Chat Completions API 和 Function Calling，包含安全的算术工具、当前时间工具、多轮对话与自动化测试。
+项目使用 OpenAI Responses API（手写版）和 Chat Completions API（框架版）与 Function Calling，
+包含安全的算术工具、当前时间工具、多轮对话与自动化测试。
 
 同时提供两套框架实现与手写版**三方并列**：
 
@@ -173,7 +174,7 @@ minimal-agent-lg "你好"      # LangGraph 原生版
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-共 39 个测试：`test_agent.py` 覆盖手写版，`test_lc.py` 覆盖 LangChain 版，`test_lg.py` 覆盖 LangGraph 原生版。
+共 44 个测试：`test_agent.py` 覆盖手写版，`test_lc.py` 覆盖 LangChain 版，`test_lg.py` 覆盖 LangGraph 原生版。
 测试均不调用真实 API，不需要 API Key。
 
 ## 6. 核心循环
@@ -208,6 +209,20 @@ for _ in range(max_steps):
 
 1. 在 `TOOLS` 中增加 JSON Schema。
 2. 在 `execute_tool()` 中增加同名处理分支。
+
+`TOOLS` 用的是 Responses API 的**扁平**格式，`name` / `description` / `parameters` 直接挂在顶层：
+
+```python
+{
+    "type": "function",
+    "name": "calculate",
+    "description": "安全地计算一个数学表达式……",
+    "parameters": {"type": "object", "properties": {...}, "required": [...]},
+}
+```
+
+框架版不手写 schema——`@tool` 装饰器会从函数签名和 docstring 自动生成，
+只需在 `agent_lc/tools.py` 加一个包装函数即可。
 
 生产环境还应增加权限控制、超时、重试、日志、人工确认和成本上限。
 
@@ -300,8 +315,10 @@ tools     -> model      (回边)
 
 1. **步数上限是近似对齐**：LangGraph 的 `recursion_limit` 计数的是「图超级步」（一次模型请求 + 一次工具执行约 2 步），而 `MAX_STEPS` 语义是「模型请求次数」，所以取 `MAX_STEPS * 2 = 16`，两边大致相当但非严格等价。另外 `create_agent` 自己默认把 `recursion_limit` 设成 9999，所以框架版必须显式传值才能保住成本上限。
 2. **工具结果格式**：手写版用 `json.dumps(result, ensure_ascii=False)`，框架版由 `ToolNode` 序列化。两者都是 JSON 文本，结构一致。
+3. **走不同的 API 端点**：手写版走 Responses API，框架版走 Chat Completions API。两边的工具 schema 格式也因此不同：Responses API 是扁平的（`name` / `description` / `parameters` 直接挂在顶层），Chat Completions 需要嵌在 `function` 字段下。
 
-三套实现现在走**同一条** Chat Completions API 路径，对照更公平——差异只剩「循环谁来写」。
+三套实现的**循环结构**完全一致（请求模型 → 执行工具 → 回传结果 → 再请求），
+差异只剩「循环谁来写」和「走哪个 API 端点」。
 
 ### 8.5 错误处理说明
 
@@ -320,27 +337,38 @@ for chunk in run_turn_stream(client, history, "讲个笑话"):
 
 命令行入口默认就走流式，模型吐一段就显示一段。
 
-### 9.1 手写版：Chat Completions 的 stream 模式
+### 9.1 手写版：Responses API 的 stream 模式
 
 ```python
-stream = client.chat.completions.create(
-    model=MODEL, messages=history, tools=TOOLS, stream=True,
+stream = client.responses.create(
+    model=MODEL, instructions=SYSTEM_PROMPT, input=history, tools=TOOLS, stream=True,
 )
-for raw in stream:
-    delta = raw.choices[0].delta
-    if delta.content:
-        for ch in delta.content:
-            yield ch
-    if delta.tool_calls:
-        # 累积工具调用参数（分片），收齐后执行
-        ...
+for event in stream:
+    if event.type == "response.output_text.delta":
+        yield event.delta
+    elif event.type == "response.completed":
+        final_response = event.response   # 完整响应，含 output
 ```
 
-Chat Completions 的流式粒度比 Responses API 更细（千问有 13 个 delta vs 2 个），
-所以拆字后的显示更平滑。`agent/loop.py` 用累积器把分片的 `delta.tool_calls` 拼成完整调用。
+Responses API 的流式事件是**结构化**的：文本增量和工具调用分属不同事件类型，
+不需要像 Chat Completions 那样自己累积 `delta.tool_calls` 分片。
+常用事件：
+
+| 事件类型 | 含义 |
+|---|---|
+| `response.output_text.delta` | 文本增量，带 `.delta` |
+| `response.completed` | 正常收尾，带完整 `.response` |
+| `response.failed` | 失败，带 `.response.error`（`.code` / `.message`） |
+| `response.incomplete` | 输出被截断，同样带 `.response.error` |
+| `error` | 网关级错误，错误信息直接在事件上 |
+
+**失败事件必须单独处理**：SDK 只在 HTTP 错误码时抛异常，
+`HTTP 200 + status=failed` 会正常返回一个 `output` 为空的响应。
+不检查的话会拿到空回答，看起来像"模型什么都没说"。
+`agent/loop.py` 的 `_raise_if_failed()`（非流式）和 `_describe_failure()`（流式）负责这件事。
 
 注意：**工具调用的执行时机没变**——仍然等本轮模型输出收齐后才执行工具，再继续下一轮。
-所以流式只会加速“文字出现”的速度，不会让工具提前执行。
+所以流式只会加速"文字出现"的速度，不会让工具提前执行。
 
 ### 9.2 框架版：LangGraph 的 stream_mode
 
@@ -367,9 +395,9 @@ LangGraph 还有其他模式：`"updates"`（按节点汇报）、`"values"`（�
 
 | 维度 | 手写版 | LangChain 版 | LangGraph 原生版 |
 |---|---|---|---|
-| 底层接口 | `client.responses.stream()` | `graph.stream()` | `graph.stream()` |
-| 事件归一化 | 自己写 `StreamEvent` | 框架已归一化 | 框架已归一化 |
-| 过滤工具结果 | 事件类型天然区分 | `isinstance` 判断 | `isinstance` 判断 |
+| 底层接口 | `client.responses.create(stream=True)` | `graph.stream()` | `graph.stream()` |
+| 事件来源 | `response.output_text.delta` 等结构化事件 | `AIMessageChunk` | `AIMessageChunk` |
+| 过滤工具结果 | 只 yield 文本增量事件，工具结果天然不进来 | `isinstance` 判断 | `isinstance` 判断 |
 | 模型需流式 | 不需要（stream 模式自带） | `ChatOpenAI(streaming=True)` | `ChatOpenAI(streaming=True)` |
 | 工具执行时机 | 本轮收齐后 | 本轮收齐后 | 本轮收齐后 |
 
