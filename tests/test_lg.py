@@ -135,6 +135,12 @@ class GraphShapeTests(unittest.TestCase):
         handwritten = [t["name"] for t in agent.tools.TOOLS]
         self.assertEqual([t.name for t in agent_lg.build_tools()], handwritten)
 
+    def test_build_model_uses_responses_api(self) -> None:
+        """框架版必须走 Responses API，才能和手写版对照同一端点。"""
+        model = agent_lg.build_model()
+        self.assertTrue(getattr(model, "use_responses_api", False))
+        self.assertEqual(getattr(model, "output_version", None), "responses/v1")
+
 
 class EndToEndTests(unittest.TestCase):
     """B. 假模型端到端。"""

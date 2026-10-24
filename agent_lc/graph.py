@@ -29,6 +29,13 @@ def build_model(streaming: bool = True) -> Any:
     显式传 api_key 和 base_url，而不是依赖 SDK 隐式读环境变量，
     这样即使换网关也只需改 .env，行为可预期。
 
+    use_responses_api=True：走 OpenAI Responses API（/v1/responses），
+    和手写版 agent/ 保持同一个端点，三套实现的对照才公平。
+
+    output_version="responses/v1"：让 reasoning 摘要、内置工具调用等
+    响应项落进 AIMessage.content（内容块列表）而不是 additional_kwargs，
+    这是 langchain-openai 官方推荐的新格式。
+
     streaming=True 表示走流式接口：即使调用 invoke()，
     底层也是流式请求再聚合，对应 graph.stream() 能拿到逐字增量。
     """
@@ -38,6 +45,8 @@ def build_model(streaming: bool = True) -> Any:
         model=MODEL,
         api_key=os.getenv("OPENAI_API_KEY"),
         base_url=os.getenv("OPENAI_BASE_URL") or None,
+        use_responses_api=True,
+        output_version="responses/v1",
         streaming=streaming,
     )
 
@@ -68,6 +77,36 @@ def build_agent(
     )
 
 
+def message_text(message: Any) -> str:
+    """从一条消息里提取纯文本。
+
+    Responses API（output_version="responses/v1"）下 AIMessage.content
+    是**内容块列表**，形如 [{"type": "text", "text": "..."}, ...]，
+    而不是 Chat Completions 那种单个字符串。
+
+    AIMessage.text 属性对两种形态都正确（字符串 content 原样返回，
+    块列表则拼接其中的 text 块），所以优先用它；
+    假模型 / 旧版消息对象没有 .text 时再回退到 content。
+    """
+    text = getattr(message, "text", None)
+    if isinstance(text, str):
+        return text
+
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        # 内容块列表：只取 type=="text" 的块，跳过 reasoning / tool_call 等。
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+        return "".join(parts)
+
+    return ""
+
+
 def run_turn_stream(
     agent: Any,
     user_text: str,
@@ -92,8 +131,9 @@ def run_turn_stream(
         if not isinstance(chunk, AIMessageChunk):
             # 工具结果等非模型文本，跳过。
             continue
-        text = chunk.content
-        # 最后一个块是空内容的收尾块，跳过。
+        # Responses API 下 content 是块列表，要用 message_text 提取纯文本。
+        text = message_text(chunk)
+        # 空内容的收尾块跳过。
         if text:
             # 逐字吐出，避免终端一次性显示一整段。
             for ch in text:
@@ -121,8 +161,8 @@ def run_turn(agent: Any, user_text: str, thread_id: str = DEFAULT_THREAD_ID) -> 
         return "（模型没有返回文本）"
 
     last = messages[-1]
-    content = getattr(last, "content", None)
-    return content or "（模型没有返回文本）"
+    # Responses API 下 content 是块列表，用 message_text 提取纯文本。
+    return message_text(last) or "（模型没有返回文本）"
 
 
 def clear_thread(checkpointer: Any, thread_id: str = DEFAULT_THREAD_ID) -> None:

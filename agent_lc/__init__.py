@@ -14,6 +14,7 @@ from agent_lc.graph import (
     build_model,
     build_tools,
     clear_thread,
+    message_text,
     run_turn,
     run_turn_stream,
 )
@@ -29,6 +30,7 @@ __all__ = [
     "calculate",
     "clear_thread",
     "get_current_time",
+    "message_text",
     "run_turn",
     "run_turn_stream",
 ]

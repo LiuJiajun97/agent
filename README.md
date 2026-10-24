@@ -14,8 +14,11 @@ Python 执行工具
 最终回答
 ```
 
-项目使用 OpenAI Responses API（手写版）和 Chat Completions API（框架版）与 Function Calling，
+项目使用 OpenAI **Responses API**（`/v1/responses`）与 Function Calling，
 包含安全的算术工具、当前时间工具、多轮对话与自动化测试。
+
+三套实现（手写版、LangChain 版、LangGraph 原生版）走**同一条** API 路径，
+可以直接横向对比。
 
 同时提供两套框架实现与手写版**三方并列**：
 
@@ -174,7 +177,7 @@ minimal-agent-lg "你好"      # LangGraph 原生版
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-共 44 个测试：`test_agent.py` 覆盖手写版，`test_lc.py` 覆盖 LangChain 版，`test_lg.py` 覆盖 LangGraph 原生版。
+共 50 个测试：`test_agent.py` 覆盖手写版，`test_lc.py` 覆盖 LangChain 版，`test_lg.py` 覆盖 LangGraph 原生版。
 测试均不调用真实 API，不需要 API Key。
 
 ## 6. 核心循环
@@ -245,6 +248,19 @@ agent = create_agent(
 )
 ```
 
+模型客户端这样构造，指定走 Responses API：
+
+```python
+model = ChatOpenAI(
+    model=MODEL,
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_BASE_URL") or None,
+    use_responses_api=True,        # 走 /v1/responses
+    output_version="responses/v1", # content 用内容块列表格式
+    streaming=True,
+)
+```
+
 多轮记忆由 checkpointer 按 `thread_id` 自动维护，每次只需传入本轮消息：
 
 ```python
@@ -255,8 +271,19 @@ result = agent.invoke(
         "recursion_limit": RECURSION_LIMIT,
     },
 )
-answer = result["messages"][-1].content
+answer = message_text(result["messages"][-1])   # 见下方说明
 ```
+
+**注意 `content` 的格式差异**：Responses API 下（`output_version="responses/v1"`）
+`AIMessage.content` 是**内容块列表**而不是字符串：
+
+```python
+[{"type": "reasoning", "summary": [], "id": "rs_..."},
+ {"type": "text", "text": "答案是 949", "index": 1}]
+```
+
+所以取纯文本要用 `message.text`（对两种格式都兼容），
+或者像本项目那样写个 `message_text()` 辅助函数自己抽。
 
 ### 8.2 LangGraph 原生版（`agent_lg/`）
 
@@ -299,7 +326,7 @@ def route_after_model(state: AgentState) -> str:
 | 多轮记忆 | 手工维护 `history` 列表 | `InMemorySaver` + `thread_id` | 同 LangChain 版 |
 | 步数上限 | `MAX_STEPS = 8`（模型请求数） | `recursion_limit = 16`（图超级步） | 同 LangChain 版 |
 | 工具错误回传 | 显式包装成 `{"ok": False, ...}` | 同左 | 同左 |
-| 走的 API 路径 | Responses API `/v1/responses` | Chat Completions `/v1/chat/completions` | 同 LangChain 版 |
+| 走的 API 路径 | Responses API `/v1/responses` | Responses API `/v1/responses` | 同 LangChain 版 |
 | 命令 | `minimal-agent` | `minimal-agent-lc` | `minimal-agent-lg` |
 
 三套实现生成的图结构完全一致，都是：
@@ -315,10 +342,10 @@ tools     -> model      (回边)
 
 1. **步数上限是近似对齐**：LangGraph 的 `recursion_limit` 计数的是「图超级步」（一次模型请求 + 一次工具执行约 2 步），而 `MAX_STEPS` 语义是「模型请求次数」，所以取 `MAX_STEPS * 2 = 16`，两边大致相当但非严格等价。另外 `create_agent` 自己默认把 `recursion_limit` 设成 9999，所以框架版必须显式传值才能保住成本上限。
 2. **工具结果格式**：手写版用 `json.dumps(result, ensure_ascii=False)`，框架版由 `ToolNode` 序列化。两者都是 JSON 文本，结构一致。
-3. **走不同的 API 端点**：手写版走 Responses API，框架版走 Chat Completions API。两边的工具 schema 格式也因此不同：Responses API 是扁平的（`name` / `description` / `parameters` 直接挂在顶层），Chat Completions 需要嵌在 `function` 字段下。
+3. **工具 schema 格式**：手写版直接写 Responses API 的扁平 schema；框架版由 `@tool` 装饰器从函数签名自动生成，再由 LangChain 转成 API 需要的格式。底层结果一致，但生成方式不同。
 
-三套实现的**循环结构**完全一致（请求模型 → 执行工具 → 回传结果 → 再请求），
-差异只剩「循环谁来写」和「走哪个 API 端点」。
+三套实现的**循环结构**和**API 端点**完全一致（请求模型 → 执行工具 → 回传结果 → 再请求），
+差异只剩「循环谁来写」。
 
 ### 8.5 错误处理说明
 
@@ -378,7 +405,7 @@ for chunk, metadata in agent.stream(
     config={"configurable": {"thread_id": thread_id}},
     stream_mode="messages",
 ):
-    yield chunk.content
+    yield message_text(chunk)
 ```
 
 `stream_mode="messages"` 产出 `(消息块, 元数据)` 二元组，消息块是 `AIMessageChunk`。
@@ -389,6 +416,9 @@ if not isinstance(chunk, AIMessageChunk):
     continue   # 工具结果不混进回答里
 ```
 
+另外 Responses API 下 `chunk.content` 同样是内容块列表，
+所以取文本要走 `message_text(chunk)` 而不是直接用 `chunk.content`。
+
 LangGraph 还有其他模式：`"updates"`（按节点汇报）、`"values"`（每步完整状态）。
 
 ### 9.3 三套实现对照
@@ -396,7 +426,9 @@ LangGraph 还有其他模式：`"updates"`（按节点汇报）、`"values"`（�
 | 维度 | 手写版 | LangChain 版 | LangGraph 原生版 |
 |---|---|---|---|
 | 底层接口 | `client.responses.create(stream=True)` | `graph.stream()` | `graph.stream()` |
+| API 端点 | `/v1/responses` | `/v1/responses` | `/v1/responses` |
 | 事件来源 | `response.output_text.delta` 等结构化事件 | `AIMessageChunk` | `AIMessageChunk` |
+| 提取纯文本 | 事件自带 `.delta` | `message_text()`（content 是块列表） | `message_text()`（content 是块列表） |
 | 过滤工具结果 | 只 yield 文本增量事件，工具结果天然不进来 | `isinstance` 判断 | `isinstance` 判断 |
 | 模型需流式 | 不需要（stream 模式自带） | `ChatOpenAI(streaming=True)` | `ChatOpenAI(streaming=True)` |
 | 工具执行时机 | 本轮收齐后 | 本轮收齐后 | 本轮收齐后 |

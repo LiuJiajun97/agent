@@ -88,7 +88,6 @@ class ToolTests(unittest.TestCase):
         """两套实现的工具集必须等价，否则对照实验不成立。"""
         handwritten = [t["name"] for t in agent.tools.TOOLS]
         self.assertEqual([t.name for t in agent_lc.build_tools()], handwritten)
-
     def test_calculate_tool_metadata(self) -> None:
         tool = agent_lc.calculate
         self.assertEqual(tool.name, "calculate")
@@ -112,6 +111,41 @@ class ToolTests(unittest.TestCase):
         self.assertIn("utc_offset_seconds", result)
 
 
+class MessageTextTests(unittest.TestCase):
+    """A2. Responses API 的 content 块列表适配。"""
+
+    def test_plain_string_content(self) -> None:
+        """Chat Completions 风格的字符串 content。"""
+        msg = AIMessage(content="你好")
+        self.assertEqual(agent_lc.message_text(msg), "你好")
+
+    def test_responses_block_list_content(self) -> None:
+        """Responses API 风格的块列表 content，要拼接其中的 text 块。"""
+        msg = AIMessage(
+            content=[
+                {"type": "reasoning", "summary": [], "id": "rs_1"},
+                {"type": "text", "text": "答案是 ", "index": 1},
+                {"type": "text", "text": "949", "index": 2},
+            ]
+        )
+        self.assertEqual(agent_lc.message_text(msg), "答案是 949")
+
+    def test_block_list_skips_non_text_blocks(self) -> None:
+        """reasoning / tool_call 等非 text 块不能混进回答。"""
+        msg = AIMessage(
+            content=[
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "思考中"}]},
+                {"type": "text", "text": "只有这句"},
+            ]
+        )
+        text = agent_lc.message_text(msg)
+        self.assertEqual(text, "只有这句")
+        self.assertNotIn("思考中", text)
+
+    def test_empty_content(self) -> None:
+        self.assertEqual(agent_lc.message_text(AIMessage(content="")), "")
+
+
 class GraphTests(unittest.TestCase):
     """B. 图构建。"""
 
@@ -124,6 +158,12 @@ class GraphTests(unittest.TestCase):
         model = FakeToolCallingModel(responses=[AIMessage(content="hi")])
         agent = agent_lc.build_agent(model=model)
         self.assertTrue(hasattr(agent, "invoke"))
+
+    def test_build_model_uses_responses_api(self) -> None:
+        """框架版必须走 Responses API，才能和手写版对照同一端点。"""
+        model = agent_lc.build_model()
+        self.assertTrue(getattr(model, "use_responses_api", False))
+        self.assertEqual(getattr(model, "output_version", None), "responses/v1")
 
 
 class EndToEndTests(unittest.TestCase):
