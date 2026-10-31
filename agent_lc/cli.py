@@ -1,4 +1,8 @@
-"""LangChain 版命令行入口：与 agent/cli.py 交互体验一致，便于横向对照。"""
+"""LangChain 版命令行入口：与 agent/cli.py 交互体验一致，便于横向对照。
+
+本文件与 agent/cli.py、agent_lg/cli.py 的 REPL 骨架刻意保持逐行相似，
+方便横向对照三套实现；改交互行为时三处需要同步改。
+"""
 
 from __future__ import annotations
 

@@ -6,6 +6,9 @@
 3. run_agent_turn - 选择 API 后端、注入配置，并负责出错回滚
 4. agent_loop_stream / run_agent_turn_stream - 上面两者的流式版本
 
+两个循环变体共用同一段工具执行逻辑（_execute_tool_calls），
+单轮封装的回滚逻辑也共用（_begin_turn / _rollback_on_error）。
+
 循环本身不关心底层是 Responses API 还是 Chat Completions：
 两种 API 的差异由 agent/backends.py 翻译成 Turn 和流式事件。
 """
@@ -13,6 +16,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from typing import Any, Iterator
 
 from agent.backends import (
@@ -67,6 +71,47 @@ def _append_tool_result(
     )
 
 
+def _execute_tool_calls(
+    history: list[dict[str, Any]], turn: Turn, run_tool_call: Any
+) -> None:
+    """执行本轮模型要的工具调用，并把结果回传进历史。
+
+    非流式与流式两个循环变体在这一步完全一致，
+    抽出来避免同一段逻辑在两处各写一遍、改一处忘另一处。
+    """
+    for call in turn.tool_calls:
+        result = run_tool_call(call)
+        _append_tool_result(history, call, result)
+
+
+def _begin_turn(history: list[dict[str, Any]], user_text: str) -> int:
+    """开始一轮对话：追加用户消息，返回回滚时要用的起始下标。"""
+    history_start = len(history)
+    history.append({"role": "user", "content": user_text})
+    return history_start
+
+
+@contextmanager
+def _rollback_on_error(
+    history: list[dict[str, Any]], history_start: int
+) -> Iterator[None]:
+    """出错时把历史回滚到本轮开始之前，避免留下"有问无答"的残缺历史。"""
+    try:
+        yield
+    except Exception:
+        # 先回滚，再用裸 raise 保留原始异常信息。
+        del history[history_start:]
+        raise
+
+
+def _max_steps_exceeded(max_steps: int) -> RuntimeError:
+    """超过最大模型请求次数时抛出的异常。
+
+    两个循环变体共用这一处，保证报错文案不会走偏。
+    """
+    return RuntimeError(f"超过最大工具调用轮数 ({max_steps})")
+
+
 def agent_loop(
     request: Any,
     run_tool_call: Any,
@@ -91,11 +136,9 @@ def agent_loop(
         if not turn.tool_calls:
             return turn.text
 
-        for call in turn.tool_calls:
-            result = run_tool_call(call)
-            _append_tool_result(history, call, result)
+        _execute_tool_calls(history, turn, run_tool_call)
 
-    raise RuntimeError(f"超过最大工具调用轮数 ({max_steps})")
+    raise _max_steps_exceeded(max_steps)
 
 
 def run_agent_turn(
@@ -113,19 +156,13 @@ def run_agent_turn(
 
     这是 agent_loop 的薄封装：选择 API 后端，并负责出错时回滚历史。
     """
-    # 记下起始位置，出错时回滚，避免留下"有问无答"的残缺历史。
-    history_start = len(history)
-    history.append({"role": "user", "content": user_text})
+    history_start = _begin_turn(history, user_text)
 
-    try:
+    with _rollback_on_error(history, history_start):
         backend = build_backend(client, style)
         return agent_loop(
             lambda: backend.request(history), _tool_result_for, history, MAX_STEPS
         )
-    except Exception:
-        # 先回滚，再用裸 raise 保留原始异常信息。
-        del history[history_start:]
-        raise
 
 
 # ---- 流式版本 ----
@@ -167,11 +204,9 @@ def agent_loop_stream(
         if not turn.tool_calls:
             return
 
-        for call in turn.tool_calls:
-            result = run_tool_call(call)
-            _append_tool_result(history, call, result)
+        _execute_tool_calls(history, turn, run_tool_call)
 
-    raise RuntimeError(f"超过最大工具调用轮数 ({max_steps})")
+    raise _max_steps_exceeded(max_steps)
 
 
 def run_agent_turn_stream(
@@ -184,12 +219,13 @@ def run_agent_turn_stream(
 
     style 不传时用 OPENAI_API_STYLE 的值（responses / chat）。
 
+    注意这是一个惰性生成器：用户消息在调用时立刻写入历史，
+    但出错回滚要等到生成器被消费时才发生——调用方一旦开始迭代就按流式语义走。
     """
-    history_start = len(history)
-    history.append({"role": "user", "content": user_text})
+    history_start = _begin_turn(history, user_text)
 
     def _generate() -> Iterator[str]:
-        try:
+        with _rollback_on_error(history, history_start):
             backend = build_backend(client, style)
             yield from agent_loop_stream(
                 lambda: backend.request_stream(history),
@@ -197,8 +233,5 @@ def run_agent_turn_stream(
                 history,
                 MAX_STEPS,
             )
-        except Exception:
-            del history[history_start:]
-            raise
 
     return _generate()

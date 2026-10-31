@@ -15,6 +15,12 @@ create_agent 生成的图长这样：
 - agent/loop.py 的 agent_loop()  <-  本文件的 model / tools 节点 + 条件边
 - agent/loop.py 的 history 列表  <-  本文件的 AgentState.messages
 - agent/loop.py 的 MAX_STEPS     <-  RECURSION_LIMIT（转发自 agent_lc.graph）
+
+本包自有的只有两样：AgentState（状态定义）和 build_graph（手画的图）。
+build_model / build_checkpointer / run_turn / run_turn_stream / clear_thread
+全部转发自 agent_lc.graph——create_agent 生成的图和这里手画的图，
+对调用方来说是同一个接口（都有 invoke / stream），所以这些共用逻辑不必写两遍。
+agent_lg/tools.py 同样是纯转发，工具层统一委托给 agent_lc.tools。
 """
 
 from __future__ import annotations

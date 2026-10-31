@@ -72,7 +72,7 @@ agent/
 建议使用 Python 3.10 或更高版本。
 
 ```powershell
-cd C:\Users\LJJ\Desktop\agent
+cd <仓库目录>
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
@@ -127,7 +127,7 @@ $env:OPENAI_API_KEY = "你的 API Key"
 将项目解释器指向：
 
 ```text
-C:\Users\LJJ\Desktop\agent\.venv\Scripts\python.exe
+<仓库目录>\.venv\Scripts\python.exe
 ```
 
 路径：`Settings` → `Project: agent` → `Python Interpreter` → `Add Interpreter` → `Add Local Interpreter` → `Existing`。

@@ -27,6 +27,7 @@ class ToolTests(unittest.TestCase):
         """两套实现的工具集必须等价，否则对照实验不成立。"""
         handwritten = [t["name"] for t in agent.tools.TOOLS]
         self.assertEqual([t.name for t in agent_lc.build_tools()], handwritten)
+
     def test_calculate_tool_metadata(self) -> None:
         tool = agent_lc.calculate
         self.assertEqual(tool.name, "calculate")

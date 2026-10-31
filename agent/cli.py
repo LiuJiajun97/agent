@@ -1,4 +1,8 @@
-"""命令行入口：支持单次问答和交互式多轮对话。"""
+"""命令行入口：支持单次问答和交互式多轮对话。
+
+本文件与 agent_lc/cli.py、agent_lg/cli.py 的 REPL 骨架刻意保持逐行相似，
+方便横向对照三套实现；改交互行为时三处需要同步改。
+"""
 
 from __future__ import annotations
 

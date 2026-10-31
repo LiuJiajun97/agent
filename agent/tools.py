@@ -64,6 +64,27 @@ _UNARY_OPS = {
 }
 
 
+def _validate_result(result: int | float) -> int | float:
+    """检查计算结果是否安全，不安全就抛异常。
+
+    单独抽出来是因为这些限制跟"怎么算"无关，
+    是所有运算路径都要过的同一道关卡。
+    """
+    # 限制超大整数，避免大底数 ** 大指数算出几万位的整数耗尽资源。
+    if isinstance(result, int) and result.bit_length() > 4096:
+        raise ValueError("计算结果过大")
+
+    # 排除 NaN 和 Infinity，例如 1e308 * 1e308。
+    if isinstance(result, float) and not math.isfinite(result):
+        raise ValueError("计算结果不是有限数值")
+
+    # 只返回普通数字，保证后面能安全地 json.dumps。
+    if not isinstance(result, (int, float)):
+        raise ValueError("计算结果必须是实数")
+
+    return result
+
+
 def _evaluate_ast(node: ast.AST) -> int | float:
     """递归计算一个受限的 AST 节点。
 
@@ -80,10 +101,10 @@ def _evaluate_ast(node: ast.AST) -> int | float:
     # 一元运算：+10、-3
     if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
         value = _evaluate_ast(node.operand)
-        result = _UNARY_OPS[type(node.op)](value)
+        return _validate_result(_UNARY_OPS[type(node.op)](value))
 
     # 二元运算：1 + 2、10 / 5、2 ** 8
-    elif isinstance(node, ast.BinOp) and type(node.op) in _BINARY_OPS:
+    if isinstance(node, ast.BinOp) and type(node.op) in _BINARY_OPS:
         left = _evaluate_ast(node.left)
         right = _evaluate_ast(node.right)
 
@@ -91,24 +112,9 @@ def _evaluate_ast(node: ast.AST) -> int | float:
         if isinstance(node.op, ast.Pow) and abs(right) > 100:
             raise ValueError("指数绝对值不能超过 100")
 
-        result = _BINARY_OPS[type(node.op)](left, right)
+        return _validate_result(_BINARY_OPS[type(node.op)](left, right))
 
-    else:
-        raise ValueError("表达式中包含不支持的语法")
-
-    # 限制超大整数，避免 10000 ** 100 耗尽资源。
-    if isinstance(result, int) and result.bit_length() > 4096:
-        raise ValueError("计算结果过大")
-
-    # 排除 NaN 和 Infinity，例如 1e308 * 1e308。
-    if isinstance(result, float) and not math.isfinite(result):
-        raise ValueError("计算结果不是有限数值")
-
-    # 只返回普通数字，保证后面能安全地 json.dumps。
-    if not isinstance(result, (int, float)):
-        raise ValueError("计算结果必须是实数")
-
-    return result
+    raise ValueError("表达式中包含不支持的语法")
 
 
 def calculate(expression: str) -> int | float:

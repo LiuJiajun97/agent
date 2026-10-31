@@ -191,6 +191,20 @@ def to_chat_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # ---- Responses API ----
 
 
+def _format_failure(prefix: str, code: str | None, message: str | None) -> str:
+    """把失败原因拼成一句人能看懂的错误信息。
+
+    非流式与流式两处的差异只在开头的说明文字，
+    后面 code / message 的拼装方式完全一致，所以抽出来共用。
+    """
+    parts = [prefix]
+    if code:
+        parts.append(f"code={code}")
+    if message:
+        parts.append(message)
+    return "，".join(parts)
+
+
 def _raise_if_failed(response: Any) -> None:
     """非流式响应如果状态是 failed / incomplete，抛出带真实原因的异常。
 
@@ -205,12 +219,9 @@ def _raise_if_failed(response: Any) -> None:
     code = getattr(error, "code", None)
     message = getattr(error, "message", None)
 
-    parts = [f"模型响应未成功完成（status={status}）"]
-    if code:
-        parts.append(f"code={code}")
-    if message:
-        parts.append(message)
-    raise RuntimeError("，".join(parts))
+    raise RuntimeError(
+        _format_failure(f"模型响应未成功完成（status={status}）", code, message)
+    )
 
 
 def _describe_failure(event: Any) -> str:
@@ -235,11 +246,7 @@ def _describe_failure(event: Any) -> str:
     code = getattr(error, "code", None)
     message = getattr(error, "message", None) or "（无详细信息）"
 
-    parts = [f"流式响应失败（{kind}）"]
-    if code:
-        parts.append(f"code={code}")
-    parts.append(message)
-    return "，".join(parts)
+    return _format_failure(f"流式响应失败（{kind}）", code, message)
 
 
 def _turn_from_response(response: Any) -> Turn:
@@ -326,6 +333,30 @@ class ResponsesBackend:
 # ---- Chat Completions API ----
 
 
+def _merge_tool_call_fragment(buffer: dict[str, Any], fragment: Any) -> None:
+    """把一个工具调用分片并进 buffer。
+
+    Chat Completions 的流式响应把一次工具调用拆成多个分片下发：
+    id 和 name 只在首个分片出现，后面的分片只带 arguments 片段。
+    所以 id / name 覆盖写，arguments 追加。
+    """
+    fragment_id = getattr(fragment, "id", None)
+    if fragment_id:
+        buffer["id"] = fragment_id
+
+    function = getattr(fragment, "function", None)
+    if function is None:
+        return
+
+    name = getattr(function, "name", None)
+    if name:
+        buffer["name"] = name
+
+    arguments = getattr(function, "arguments", None)
+    if arguments:
+        buffer["arguments"] += arguments
+
+
 class ChatCompletionsBackend:
     """Chat Completions API（/v1/chat/completions）适配器。"""
 
@@ -409,18 +440,7 @@ class ChatCompletionsBackend:
                     buffer = call_buffers.setdefault(
                         index, {"id": None, "name": "", "arguments": ""}
                     )
-                    fragment_id = getattr(fragment, "id", None)
-                    if fragment_id:
-                        buffer["id"] = fragment_id
-
-                    function = getattr(fragment, "function", None)
-                    if function is not None:
-                        name = getattr(function, "name", None)
-                        if name:
-                            buffer["name"] = name
-                        arguments = getattr(function, "arguments", None)
-                        if arguments:
-                            buffer["arguments"] += arguments
+                    _merge_tool_call_fragment(buffer, fragment)
 
             if getattr(choice, "finish_reason", None) == "length":
                 yield Failed("模型输出被截断（finish_reason=length）")
