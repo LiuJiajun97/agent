@@ -202,8 +202,8 @@ def _raise_if_failed(response: Any) -> None:
         return
 
     error = getattr(response, "error", None)
-    code = getattr(error, "code", None) if error is not None else None
-    message = getattr(error, "message", None) if error is not None else None
+    code = getattr(error, "code", None)
+    message = getattr(error, "message", None)
 
     parts = [f"模型响应未成功完成（status={status}）"]
     if code:
@@ -224,7 +224,7 @@ def _describe_failure(event: Any) -> str:
     kind = getattr(event, "type", "unknown")
 
     response = getattr(event, "response", None)
-    error = getattr(response, "error", None) if response is not None else None
+    error = getattr(response, "error", None)
 
     if error is None:
         error = event if kind == "error" else None

@@ -1,84 +1,23 @@
-"""LangChain 版测试：不调用真实 API，不需要 API Key。"""
+"""LangChain 版测试。
+
+覆盖四部分：
+- 工具层与 message_text 的 content 形态适配（纯逻辑）
+- 图构建与 build_model 的默认参数（纯逻辑）
+- 端到端对话（真实调用网关，需要 .env 里配好 OPENAI_API_KEY / OPENAI_BASE_URL）
+- 工具出错时的回传（真实调用 + 临时替换工具实现）
+"""
 
 from __future__ import annotations
 
 import json
 import unittest
-from typing import Any, Iterator
+from unittest import mock
 
-from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk
-from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from pydantic import Field
+from langchain_core.messages import AIMessage
 
 import agent.tools
 import agent_lc
-
-
-class FakeToolCallingModel(BaseChatModel):
-    """按预设顺序返回消息的假模型，不发起任何网络请求。
-
-    模型每次被调用就消耗一条预设消息；
-    bind_tools 记录模型拿到的工具清单，用来验证工具确实被绑定。
-    """
-
-    responses: list[AIMessage] = Field(default_factory=list)
-    tool_calls_log: list[Any] = Field(default_factory=list)
-    # 假模型默认也会逐字输出，模拟真实模型的流式行为。
-    stream_chunks: list[str] = Field(default_factory=list)
-
-    @property
-    def _llm_type(self) -> str:
-        return "fake-tool-calling"
-
-    def bind_tools(self, tools: Any, **kwargs: Any) -> "FakeToolCallingModel":
-        self.tool_calls_log.append(list(tools))
-        return self
-
-    def _generate(
-        self,
-        messages: Any,
-        stop: Any = None,
-        run_manager: Any = None,
-        **kwargs: Any,
-    ) -> ChatResult:
-        if not self.responses:
-            return ChatResult(generations=[ChatGeneration(message=AIMessage(content=""))])
-        message = self.responses.pop(0)
-        return ChatResult(generations=[ChatGeneration(message=message)])
-
-    def _stream(
-        self,
-        messages: Any,
-        stop: Any = None,
-        run_manager: Any = None,
-        **kwargs: Any,
-    ) -> Iterator[ChatGenerationChunk]:
-        if self.stream_chunks:
-            for piece in self.stream_chunks:
-                yield ChatGenerationChunk(message=AIMessageChunk(content=piece))
-            return
-
-        # 没有预设流式片段时，把预设回复整段输出。
-        message = self.responses.pop(0) if self.responses else AIMessage(content="")
-        if message.tool_calls:
-            # 流式下的工具调用要用 tool_call_chunks 表达。
-            call = message.tool_calls[0]
-            yield ChatGenerationChunk(
-                message=AIMessageChunk(
-                    content="",
-                    tool_call_chunks=[
-                        {
-                            "name": call["name"],
-                            "args": json.dumps(call["args"], ensure_ascii=False),
-                            "id": call["id"],
-                            "index": 0,
-                        }
-                    ],
-                )
-            )
-            return
-        yield ChatGenerationChunk(message=AIMessageChunk(content=message.content))
+from tests.live import require_gateway
 
 
 class ToolTests(unittest.TestCase):
@@ -155,9 +94,13 @@ class GraphTests(unittest.TestCase):
         self.assertTrue(hasattr(agent, "get_graph"))
 
     def test_build_agent_accepts_injected_model(self) -> None:
-        model = FakeToolCallingModel(responses=[AIMessage(content="hi")])
-        agent = agent_lc.build_agent(model=model)
-        self.assertTrue(hasattr(agent, "invoke"))
+        """可以注入自己的模型（这里是真实模型），建出来的图能正常对话。"""
+        require_gateway()
+        agent = agent_lc.build_agent(model=agent_lc.build_model())
+
+        answer = agent_lc.run_turn(agent, "用一句话说明什么是哈希表", thread_id="t1")
+
+        self.assertTrue(answer.strip())
 
     def test_build_model_defaults_to_responses_api(self) -> None:
         """默认走 Responses API，才能和手写版对照同一端点。"""
@@ -173,120 +116,139 @@ class GraphTests(unittest.TestCase):
 
 
 class EndToEndTests(unittest.TestCase):
-    """C. 假模型端到端。"""
+    """C. 真实网关端到端。"""
 
     def test_tool_call_is_executed_and_returned_to_model(self) -> None:
-        tool_call = AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "name": "calculate",
-                    "args": {"expression": "(128 * 37 + 9) / 5"},
-                    "id": "call_1",
-                }
-            ],
+        """真实调用：模型发起 calculate，工具结果作为 ToolMessage 回传。"""
+        require_gateway()
+        agent = agent_lc.build_agent()
+
+        answer = agent_lc.run_turn(
+            agent, "请使用 calculate 工具计算 123 * 45", thread_id="t2"
         )
-        model = FakeToolCallingModel(responses=[tool_call, AIMessage(content="计算结果是 949")])
-        agent = agent_lc.build_agent(model=model)
 
-        answer = agent_lc.run_turn(agent, "请计算", thread_id="t1")
+        self.assertTrue(answer.strip())
 
-        self.assertEqual(answer, "计算结果是 949")
-        # 模型确实拿到了工具清单。
-        self.assertTrue(model.tool_calls_log)
+        state = agent.get_state({"configurable": {"thread_id": "t2"}})
+        tool_messages = [m for m in state.values.get("messages", []) if m.type == "tool"]
+        self.assertEqual(len(tool_messages), 1)
+
+        payload = json.loads(tool_messages[0].content)
+        self.assertTrue(payload["ok"])
+        self.assertIsInstance(payload["result"], (int, float))
 
     def test_tool_error_is_returned_to_model(self) -> None:
         """工具出错时错误要回传给模型，循环继续，而不是直接崩掉。"""
-        tool_call = AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "name": "calculate",
-                    "args": {"expression": "a + 1"},
-                    "id": "call_1",
-                }
-            ],
-        )
-        model = FakeToolCallingModel(responses=[tool_call, AIMessage(content="表达式不合法")])
-        agent = agent_lc.build_agent(model=model)
+        require_gateway()
+        agent = agent_lc.build_agent()
 
-        answer = agent_lc.run_turn(agent, "请计算", thread_id="t2")
+        # 让真实工具失败：错误要经过工具层的包装，再回传给模型。
+        with mock.patch.object(
+            agent_lc.tools, "_calculate", side_effect=ValueError("表达式不合法")
+        ):
+            answer = agent_lc.run_turn(
+                agent, "请使用 calculate 工具计算 123 * 45", thread_id="t3"
+            )
 
-        self.assertEqual(answer, "表达式不合法")
+        self.assertTrue(answer.strip())
+
+        state = agent.get_state({"configurable": {"thread_id": "t3"}})
+        tool_messages = [m for m in state.values.get("messages", []) if m.type == "tool"]
+        self.assertGreaterEqual(len(tool_messages), 1)
+        payload = json.loads(tool_messages[0].content)
+        self.assertFalse(payload["ok"])
+        self.assertIn("ValueError", payload["error"])
 
     def test_multi_turn_uses_checkpointer(self) -> None:
         """第二轮提问时，历史应当已被 checkpointer 保留。"""
-        model = FakeToolCallingModel(responses=[AIMessage(content="第一轮回答"), AIMessage(content="第二轮回答")])
-        agent = agent_lc.build_agent(model=model)
+        require_gateway()
+        agent = agent_lc.build_agent()
 
-        first = agent_lc.run_turn(agent, "第一问", thread_id="t3")
-        second = agent_lc.run_turn(agent, "第二问", thread_id="t3")
+        first = agent_lc.run_turn(agent, "用一句话说明什么是质数", thread_id="t4")
+        second = agent_lc.run_turn(agent, "用一句话说明什么是合数", thread_id="t4")
 
-        self.assertEqual(first, "第一轮回答")
-        self.assertEqual(second, "第二轮回答")
+        self.assertTrue(first.strip())
+        self.assertTrue(second.strip())
+
+        state = agent.get_state({"configurable": {"thread_id": "t4"}})
+        messages = state.values.get("messages", [])
+        users = [m for m in messages if m.type == "human"]
+        self.assertEqual(len(users), 2)
+        self.assertEqual(users[0].content, "用一句话说明什么是质数")
+        self.assertEqual(users[1].content, "用一句话说明什么是合数")
 
     def test_clear_thread_resets_history(self) -> None:
+        """清空线程后历史确实少了，但线程还能继续用。"""
+        require_gateway()
         checkpointer = agent_lc.build_checkpointer()
-        agent_lc.clear_thread(checkpointer, "t4")
-        # 清空后不应抛异常，且线程可以继续使用。
-        agent = agent_lc.build_agent(
-            model=FakeToolCallingModel(responses=[AIMessage(content="ok")]),
-            checkpointer=checkpointer,
+        agent = agent_lc.build_agent(checkpointer=checkpointer)
+
+        agent_lc.run_turn(agent, "用一句话说明什么是质数", thread_id="t5")
+        before = len(
+            agent.get_state({"configurable": {"thread_id": "t5"}})
+            .values.get("messages", [])
         )
-        answer = agent_lc.run_turn(agent, "你好", thread_id="t4")
-        self.assertEqual(answer, "ok")
+
+        agent_lc.clear_thread(checkpointer, "t5")
+        after = len(
+            agent.get_state({"configurable": {"thread_id": "t5"}})
+            .values.get("messages", [])
+        )
+
+        self.assertLess(after, before)
+
+        # 清空后线程可以继续使用。
+        answer = agent_lc.run_turn(agent, "用一句话说明什么是合数", thread_id="t5")
+        self.assertTrue(answer.strip())
 
 
 class StreamingTests(unittest.TestCase):
     """D. 流式输出。"""
 
     def test_stream_yields_text_incrementally(self) -> None:
-        model = FakeToolCallingModel(
-            responses=[AIMessage(content="你好，世界")],
-            stream_chunks=["你", "好", "，", "世界"],
+        """真实流式：分片拼起来就是完整回答。"""
+        require_gateway()
+        agent = agent_lc.build_agent()
+
+        chunks = list(
+            agent_lc.run_turn_stream(
+                agent, "用一句话说明什么是冒泡排序", thread_id="lc-s1"
+            )
         )
-        agent = agent_lc.build_agent(model=model)
 
-        chunks = list(agent_lc.run_turn_stream(agent, "你好", thread_id="lc-s1"))
-
-        self.assertEqual(chunks, ["你", "好", "，", "世", "界"])
+        self.assertTrue(chunks)
+        self.assertTrue("".join(chunks).strip())
 
     def test_stream_does_not_leak_tool_output(self) -> None:
         """工具结果不应混进流式回答里。"""
-        model = FakeToolCallingModel(
-            responses=[
-                AIMessage(
-                    content="",
-                    tool_calls=[
-                        {
-                            "name": "calculate",
-                            "args": {"expression": "(128 * 37 + 9) / 5"},
-                            "id": "call_1",
-                        }
-                    ],
-                ),
-                AIMessage(content="结果是 949"),
-            ]
+        require_gateway()
+        agent = agent_lc.build_agent()
+
+        chunks = list(
+            agent_lc.run_turn_stream(
+                agent, "请使用 calculate 工具计算 123 * 45", thread_id="lc-s2"
+            )
         )
-        agent = agent_lc.build_agent(model=model)
 
-        chunks = list(agent_lc.run_turn_stream(agent, "请计算", thread_id="lc-s4"))
-
-        self.assertEqual("".join(chunks), "结果是 949")
-        self.assertNotIn("ok", "".join(chunks))
+        text = "".join(chunks)
+        self.assertTrue(text.strip())
+        # 工具结果是 JSON，不该出现在给用户看的回答里。
+        self.assertNotIn('"ok"', text)
+        self.assertNotIn('"result"', text)
 
     def test_stream_skips_empty_trailing_chunk(self) -> None:
         """收尾的空内容块不应产出空字符串。"""
-        model = FakeToolCallingModel(
-            responses=[AIMessage(content="好")],
-            stream_chunks=["好"],
-        )
-        agent = agent_lc.build_agent(model=model)
+        require_gateway()
+        agent = agent_lc.build_agent()
 
-        chunks = list(agent_lc.run_turn_stream(agent, "你好", thread_id="lc-s3"))
+        chunks = list(
+            agent_lc.run_turn_stream(
+                agent, "用一句话说明什么是哈希表", thread_id="lc-s3"
+            )
+        )
 
         self.assertTrue(all(chunks))
-        self.assertEqual("".join(chunks), "好")
+        self.assertTrue("".join(chunks).strip())
 
 
 if __name__ == "__main__":

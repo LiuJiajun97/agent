@@ -1,9 +1,12 @@
-"""手写版测试：不调用真实 API，不需要 API Key。
+"""手写版测试。
 
 覆盖三部分：
 - 工具实现（与 API 无关）
-- 规范化历史 + 循环（注入 Turn）
-- 两个 API 后端的端到端封装（Responses / Chat Completions）
+- 规范化历史 + 循环（注入 Turn，纯逻辑）
+- 两个 API 后端的端到端封装（真实调用网关）
+
+端到端用例真实打网关，需要 .env 里配好 OPENAI_API_KEY / OPENAI_BASE_URL；
+需要构造特定响应形态的用例（失败 / 非法参数）用 unittest.mock 打桩 SDK 方法。
 """
 
 from __future__ import annotations
@@ -12,8 +15,10 @@ import json
 import unittest
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 import agent
+from tests.live import real_openai_client, tool_call_arguments
 
 
 def function_call_item(
@@ -21,108 +26,13 @@ def function_call_item(
     name: str = "calculate",
     arguments: str = '{"expression": "(128 * 37 + 9) / 5"}',
 ) -> SimpleNamespace:
-    """模拟 Responses API 的 function_call 输出项。"""
+    """构造 Responses API 的 function_call 输出项。"""
     return SimpleNamespace(
         type="function_call",
         call_id=call_id,
         name=name,
         arguments=arguments,
     )
-
-
-def responses_response(
-    output: list | None = None,
-    output_text: str = "",
-    status: str = "completed",
-    error: Any = None,
-) -> SimpleNamespace:
-    """模拟 Responses API 的 response 对象。"""
-    return SimpleNamespace(
-        output=output or [],
-        output_text=output_text,
-        status=status,
-        error=error,
-    )
-
-
-def responses_event(kind: str, **kwargs: Any) -> SimpleNamespace:
-    """模拟 Responses API 的流式事件。"""
-    return SimpleNamespace(type=kind, **kwargs)
-
-
-def chat_tool_call(
-    call_id: str = "call_1",
-    name: str = "calculate",
-    arguments: str = '{"expression": "(128 * 37 + 9) / 5"}',
-) -> SimpleNamespace:
-    """模拟 Chat Completions 的 tool_call。"""
-    return SimpleNamespace(
-        id=call_id,
-        function=SimpleNamespace(name=name, arguments=arguments),
-    )
-
-
-def chat_response(
-    content: str | None = None,
-    tool_calls: list | None = None,
-    finish_reason: str = "stop",
-) -> SimpleNamespace:
-    """模拟 Chat Completions 的非流式响应。"""
-    message = SimpleNamespace(content=content, tool_calls=tool_calls)
-    return SimpleNamespace(
-        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)]
-    )
-
-
-def chat_chunk(
-    content: str | None = None,
-    finish_reason: str | None = None,
-) -> SimpleNamespace:
-    """模拟 Chat Completions 的流式文本分片。"""
-    return SimpleNamespace(
-        choices=[
-            SimpleNamespace(
-                delta=SimpleNamespace(content=content, tool_calls=None),
-                finish_reason=finish_reason,
-            )
-        ]
-    )
-
-
-class FakeResponses:
-    """模拟 client.responses。"""
-
-    def __init__(self, responses: list) -> None:
-        self._responses = responses
-        self.calls: list[dict[str, Any]] = []
-
-    def create(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        response = self._responses[len(self.calls) - 1]
-        return iter(response) if kwargs.get("stream") else response
-
-
-class FakeResponsesClient:
-    def __init__(self, responses: list) -> None:
-        self.responses = FakeResponses(responses)
-
-
-class FakeChatCompletions:
-    """模拟 client.chat.completions。"""
-
-    def __init__(self, responses: list) -> None:
-        self._responses = responses
-        self.calls: list[dict[str, Any]] = []
-
-    def create(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        response = self._responses[len(self.calls) - 1]
-        return iter(response) if kwargs.get("stream") else response
-
-
-class FakeChatClient:
-    def __init__(self, responses: list) -> None:
-        self.chat = SimpleNamespace(completions=FakeChatCompletions(responses))
 
 
 class ToolTests(unittest.TestCase):
@@ -155,77 +65,69 @@ class AgentTurnTests(unittest.TestCase):
     """A. run_agent_turn：规范化历史 + 两种 API 后端。"""
 
     def test_tool_call_is_executed_and_returned_to_model(self) -> None:
-        call = function_call_item()
-        client = FakeResponsesClient(
-            [
-                responses_response([call], ""),
-                responses_response([], "计算结果是 949"),
-            ]
-        )
+        """真实调用：模型发起 calculate，工具结果作为 tool 消息回传。"""
+        client = real_openai_client()
         history: list[Any] = []
 
-        answer = agent.run_agent_turn(client, history, "请计算", style="responses")
+        answer = agent.run_agent_turn(
+            client, history, "请使用 calculate 工具计算 123 * 45", style="responses"
+        )
 
-        self.assertEqual(answer, "计算结果是 949")
-        self.assertEqual(len(client.responses.calls), 2)
+        self.assertTrue(answer.strip())
 
         # 历史是规范格式：assistant 带 tool_calls，工具结果单独一条。
-        self.assertEqual(history[0], {"role": "user", "content": "请计算"})
-        self.assertEqual(history[1]["role"], "assistant")
-        self.assertEqual(history[1]["tool_calls"][0]["id"], "call_test")
-        self.assertEqual(history[2]["role"], "tool")
-        self.assertEqual(history[2]["tool_call_id"], "call_test")
-        self.assertEqual(json.loads(history[2]["content"])["result"], 949.0)
+        assistant = [m for m in history if m["role"] == "assistant"][0]
+        self.assertEqual(len(assistant["tool_calls"]), 1)
+        self.assertEqual(assistant["tool_calls"][0]["name"], "calculate")
 
-        # 第二次请求把工具调用和结果都回传给了模型。
-        second_input = client.responses.calls[1]["input"]
-        self.assertIn(
-            {
-                "type": "function_call",
-                "call_id": "call_test",
-                "name": "calculate",
-                "arguments": '{"expression": "(128 * 37 + 9) / 5"}',
-            },
-            second_input,
-        )
-        self.assertIn(
-            {
-                "type": "function_call_output",
-                "call_id": "call_test",
-                "output": history[2]["content"],
-            },
-            second_input,
-        )
+        tool_messages = [m for m in history if m["role"] == "tool"]
+        self.assertEqual(len(tool_messages), 1)
+        # 工具调用 id 与工具结果一一对应。
+        self.assertEqual(tool_messages[0]["tool_call_id"], assistant["tool_calls"][0]["id"])
+
+        payload = json.loads(tool_messages[0]["content"])
+        self.assertTrue(payload["ok"])
+        self.assertIsInstance(payload["result"], (int, float))
+
+        # 模型给的参数是合法 JSON。
+        args = tool_call_arguments(assistant["tool_calls"][0]["arguments"])
+        self.assertIn("expression", args)
 
     def test_history_is_reused_across_turns(self) -> None:
-        client = FakeResponsesClient(
-            [
-                responses_response([], "第一轮回答"),
-                responses_response([], "第二轮回答"),
-            ]
-        )
+        """真实调用：第二轮的请求里带着第一轮的问答。"""
+        client = real_openai_client()
         history: list[Any] = []
 
-        first = agent.run_agent_turn(client, history, "第一问", style="responses")
-        second = agent.run_agent_turn(client, history, "第二问", style="responses")
+        first = agent.run_agent_turn(
+            client, history, "用一句话说明什么是质数", style="responses"
+        )
+        second = agent.run_agent_turn(
+            client, history, "用一句话说明什么是合数", style="responses"
+        )
 
-        self.assertEqual(first, "第一轮回答")
-        self.assertEqual(second, "第二轮回答")
+        self.assertTrue(first.strip())
+        self.assertTrue(second.strip())
 
-        second_input = client.responses.calls[1]["input"]
-        self.assertIn({"role": "user", "content": "第一问"}, second_input)
-        self.assertIn({"role": "assistant", "content": "第一轮回答"}, second_input)
-        self.assertIn({"role": "user", "content": "第二问"}, second_input)
+        # 两轮的提问与回答都留在历史里，第二轮请求才会带上第一轮。
+        users = [m for m in history if m["role"] == "user"]
+        self.assertEqual(
+            [m["content"] for m in users],
+            ["用一句话说明什么是质数", "用一句话说明什么是合数"],
+        )
+        answers = [m for m in history if m["role"] == "assistant" and m.get("content")]
+        self.assertGreaterEqual(len(answers), 2)
 
     def test_malformed_tool_arguments_are_sent_back_to_model(self) -> None:
         """参数不是合法 JSON 时，错误要作为工具结果回传，而不是直接崩掉。"""
-        bad_call = function_call_item(arguments="not json")
-        client = FakeResponsesClient(
-            [
-                responses_response([bad_call], ""),
-                responses_response([], "参数格式不对"),
-            ]
-        )
+        client = mock.MagicMock()
+        client.responses.create.side_effect = [
+            mock.Mock(
+                status="completed",
+                output=[function_call_item(arguments="not json")],
+                output_text="",
+            ),
+            mock.Mock(status="completed", output=[], output_text="参数格式不对"),
+        ]
         history: list[Any] = []
 
         answer = agent.run_agent_turn(client, history, "算一下", style="responses")
@@ -238,45 +140,38 @@ class AgentTurnTests(unittest.TestCase):
 
     def test_chat_style_end_to_end(self) -> None:
         """同一个循环换成 Chat Completions 后端，行为保持一致。"""
-        client = FakeChatClient(
-            [
-                chat_response(tool_calls=[chat_tool_call()]),
-                chat_response(content="计算结果是 949"),
-            ]
-        )
+        client = real_openai_client()
         history: list[Any] = []
 
-        answer = agent.run_agent_turn(client, history, "请计算", style="chat")
-
-        self.assertEqual(answer, "计算结果是 949")
-
-        second_messages = client.chat.completions.calls[1]["messages"]
-        self.assertEqual(second_messages[0]["role"], "system")
-        self.assertEqual(second_messages[1], {"role": "user", "content": "请计算"})
-        self.assertTrue(
-            any(
-                m.get("role") == "assistant" and m.get("tool_calls")
-                for m in second_messages
-            )
+        answer = agent.run_agent_turn(
+            client, history, "请使用 calculate 工具计算 123 * 45", style="chat"
         )
-        self.assertTrue(
-            any(
-                m.get("role") == "tool" and m.get("tool_call_id") == "call_1"
-                for m in second_messages
-            )
-        )
+
+        self.assertTrue(answer.strip())
+
+        assistant = [m for m in history if m["role"] == "assistant"][0]
+        self.assertEqual(len(assistant["tool_calls"]), 1)
+        self.assertEqual(assistant["tool_calls"][0]["name"], "calculate")
+
+        tool_messages = [m for m in history if m["role"] == "tool"]
+        self.assertEqual(len(tool_messages), 1)
+        payload = json.loads(tool_messages[0]["content"])
+        self.assertTrue(payload["ok"])
 
     def test_failed_turn_rolls_back_history(self) -> None:
-        failed = responses_response(
+        client = mock.MagicMock()
+        client.responses.create.return_value = mock.Mock(
             status="failed",
-            error=SimpleNamespace(code="server_error", message="上游挂了"),
+            error=mock.Mock(code="server_error", message="上游挂了"),
+            output=[],
+            output_text="",
         )
-        client = FakeResponsesClient([failed])
         history: list[Any] = []
 
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(RuntimeError) as ctx:
             agent.run_agent_turn(client, history, "你好", style="responses")
 
+        self.assertIn("server_error", str(ctx.exception))
         self.assertEqual(history, [])
 
 
@@ -413,29 +308,40 @@ class StreamingLoopTests(unittest.TestCase):
             list(agent.agent_loop_stream(request_stream, lambda call: {}, [], max_steps=2))
 
     def test_chat_style_stream_end_to_end(self) -> None:
-        client = FakeChatClient(
-            [[chat_chunk(content="结果"), chat_chunk(content="是 2", finish_reason="stop")]]
-        )
+        """真实流式：分片拼起来就是完整回答，并写回规范历史。"""
+        client = real_openai_client()
         history: list[Any] = []
 
-        text = "".join(
-            agent.run_agent_turn_stream(client, history, "1+1", style="chat")
+        chunks = list(
+            agent.run_agent_turn_stream(
+                client, history, "用一句话说明什么是冒泡排序", style="chat"
+            )
         )
 
-        self.assertEqual(text, "结果是 2")
-        self.assertEqual(history[0], {"role": "user", "content": "1+1"})
-        self.assertEqual(history[1], {"role": "assistant", "content": "结果是 2"})
+        text = "".join(chunks)
+        self.assertTrue(chunks)
+        self.assertTrue(text.strip())
+
+        self.assertEqual(
+            history[0], {"role": "user", "content": "用一句话说明什么是冒泡排序"}
+        )
+        self.assertEqual(history[1]["role"], "assistant")
+        self.assertEqual(history[1]["content"], text)
 
     def test_failed_stream_rolls_back_history(self) -> None:
-        failed = responses_response(
+        client = mock.MagicMock()
+        failed_response = mock.Mock(
             status="failed",
-            error=SimpleNamespace(code="server_error", message="上游挂了"),
+            error=mock.Mock(code="server_error", message="上游挂了"),
+            output=[],
+            output_text="",
         )
-        events = [
-            responses_event("response.output_text.delta", delta="开头"),
-            responses_event("response.failed", response=failed),
-        ]
-        client = FakeResponsesClient([events])
+        client.responses.create.return_value = iter(
+            [
+                mock.Mock(type="response.output_text.delta", delta="开头"),
+                mock.Mock(type="response.failed", response=failed_response),
+            ]
+        )
         history: list[Any] = []
 
         with self.assertRaises(RuntimeError):

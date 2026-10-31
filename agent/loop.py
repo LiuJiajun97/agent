@@ -95,8 +95,6 @@ def agent_loop(
             result = run_tool_call(call)
             _append_tool_result(history, call, result)
 
-        # 回到循环顶部再次请求模型，此时历史里已有工具结果。
-
     raise RuntimeError(f"超过最大工具调用轮数 ({max_steps})")
 
 
@@ -173,8 +171,6 @@ def agent_loop_stream(
             result = run_tool_call(call)
             _append_tool_result(history, call, result)
 
-        # 回到循环顶部再次请求模型，此时历史里已有工具结果。
-
     raise RuntimeError(f"超过最大工具调用轮数 ({max_steps})")
 
 
@@ -187,6 +183,7 @@ def run_agent_turn_stream(
     """流式执行一轮用户请求，逐段产出模型文本。
 
     style 不传时用 OPENAI_API_STYLE 的值（responses / chat）。
+
     """
     history_start = len(history)
     history.append({"role": "user", "content": user_text})

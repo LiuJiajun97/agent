@@ -60,6 +60,7 @@ agent/
 ├── requirements.txt        # 便于直接安装的依赖清单
 └── tests/
     ├── __init__.py
+    ├── live.py             # 真实调用网关的公共辅助
     ├── test_agent.py       # 手写版循环测试
     ├── test_backends.py    # 两种 API 适配层测试
     ├── test_lc.py          # LangChain 版测试
@@ -189,7 +190,9 @@ minimal-agent-lg "你好"      # LangGraph 原生版
 
 共 72 个测试：`test_agent.py` 覆盖手写版循环，`test_backends.py` 覆盖两种 API 适配器，
 `test_lc.py` 覆盖 LangChain 版，`test_lg.py` 覆盖 LangGraph 原生版。
-测试均不调用真实 API，不需要 API Key。
+其中 25 个会**真实调用**网关：需先在 `.env` 里配好 `OPENAI_API_KEY` 与
+`OPENAI_BASE_URL`（指向提供该模型的 OpenAI 兼容网关），缺配置会直接失败而不是跳过。
+需要构造特定响应形态（失败、截断）的用例用标准库 `unittest.mock` 打桩，不引入额外依赖。
 
 ## 6. 核心循环
 

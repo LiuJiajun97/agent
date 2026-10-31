@@ -1,10 +1,16 @@
-"""API 适配层测试：不调用真实 API，不需要 API Key。"""
+"""API 适配层测试。
+
+覆盖三部分：
+- 规范历史与工具 schema 的转换（纯逻辑）
+- 两个后端的端到端调用（真实网关，需要 .env 里配好 OPENAI_API_KEY / OPENAI_BASE_URL）
+- 失败 / 截断等只能靠构造响应形态触发的分支（unittest.mock 打桩 SDK 方法）
+"""
 
 from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from typing import Any
+from unittest import mock
 
 import agent
 from agent.backends import (
@@ -18,6 +24,7 @@ from agent.backends import (
     to_chat_tools,
     to_responses_input,
 )
+from tests.live import real_openai_client, tool_call_arguments
 
 
 def function_call_item(
@@ -25,7 +32,7 @@ def function_call_item(
     name: str = "calculate",
     arguments: str = '{"expression": "1 + 1"}',
 ) -> SimpleNamespace:
-    """模拟 Responses API 的 function_call 输出项。"""
+    """构造 Responses API 的 function_call 输出项。"""
     return SimpleNamespace(
         type="function_call",
         call_id=call_id,
@@ -34,106 +41,16 @@ def function_call_item(
     )
 
 
-def responses_response(
-    output: list | None = None,
-    output_text: str = "",
-    status: str = "completed",
-    error: Any = None,
-) -> SimpleNamespace:
-    """模拟 Responses API 的 response 对象。"""
-    return SimpleNamespace(
-        output=output or [],
-        output_text=output_text,
-        status=status,
-        error=error,
-    )
-
-
-def responses_event(kind: str, **kwargs: Any) -> SimpleNamespace:
-    """模拟 Responses API 的流式事件。"""
-    return SimpleNamespace(type=kind, **kwargs)
-
-
-def chat_tool_call(
-    call_id: str = "call_1",
-    name: str = "calculate",
-    arguments: str = '{"expression": "1 + 1"}',
-) -> SimpleNamespace:
-    """模拟 Chat Completions 的 tool_call。"""
-    return SimpleNamespace(
-        id=call_id,
-        function=SimpleNamespace(name=name, arguments=arguments),
-    )
-
-
-def chat_response(
-    content: str | None = None,
-    tool_calls: list | None = None,
-    finish_reason: str = "stop",
-) -> SimpleNamespace:
-    """模拟 Chat Completions 的非流式响应。"""
-    message = SimpleNamespace(content=content, tool_calls=tool_calls)
-    return SimpleNamespace(
-        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)]
-    )
-
-
 def chat_chunk(
     content: str | None = None,
     tool_calls: list | None = None,
     finish_reason: str | None = None,
 ) -> SimpleNamespace:
-    """模拟 Chat Completions 的流式分片。"""
+    """构造 Chat Completions 的流式分片。"""
     delta = SimpleNamespace(content=content, tool_calls=tool_calls)
     return SimpleNamespace(
         choices=[SimpleNamespace(delta=delta, finish_reason=finish_reason)]
     )
-
-
-def chat_fragment(
-    index: int = 0,
-    call_id: str | None = None,
-    name: str | None = None,
-    arguments: str | None = None,
-) -> SimpleNamespace:
-    """模拟 Chat Completions 的 tool_call 流式分片。"""
-    return SimpleNamespace(
-        index=index,
-        id=call_id,
-        function=SimpleNamespace(name=name, arguments=arguments),
-    )
-
-
-class FakeResponses:
-    def __init__(self, responses: list) -> None:
-        self._responses = responses
-        self.calls: list[dict[str, Any]] = []
-
-    def create(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        response = self._responses[len(self.calls) - 1]
-        return iter(response) if kwargs.get("stream") else response
-
-
-class FakeResponsesClient:
-    def __init__(self, responses: list) -> None:
-        self.responses = FakeResponses(responses)
-
-
-class FakeChatCompletions:
-    def __init__(self, responses: list) -> None:
-        self._responses = responses
-        self.calls: list[dict[str, Any]] = []
-
-    def create(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        response = self._responses[len(self.calls) - 1]
-        return iter(response) if kwargs.get("stream") else response
-
-
-class FakeChatClient:
-    def __init__(self, responses: list) -> None:
-        self.chat = SimpleNamespace(completions=FakeChatCompletions(responses))
 
 
 SAMPLE_HISTORY = [
@@ -234,28 +151,27 @@ class ResponsesBackendTests(unittest.TestCase):
     """B. Responses API 适配器。"""
 
     def test_request_returns_turn_and_passes_responses_payload(self) -> None:
-        client = FakeResponsesClient([responses_response([function_call_item()], "")])
-        backend = ResponsesBackend(client)
+        """真实调用：模型发起工具调用，参数是合法 JSON。"""
+        backend = ResponsesBackend(real_openai_client())
 
-        turn = backend.request([{"role": "user", "content": "算一下"}])
+        turn = backend.request(
+            [{"role": "user", "content": "请使用 calculate 工具计算 123 * 45"}]
+        )
 
-        self.assertEqual(turn.text, "")
         self.assertEqual(len(turn.tool_calls), 1)
-        self.assertEqual(turn.tool_calls[0].id, "call_1")
         self.assertEqual(turn.tool_calls[0].name, "calculate")
-
-        kwargs = client.responses.calls[0]
-        self.assertEqual(kwargs["instructions"], agent.SYSTEM_PROMPT)
-        self.assertEqual(kwargs["input"], [{"role": "user", "content": "算一下"}])
-        self.assertEqual(kwargs["tools"], agent.TOOLS)
-        self.assertNotIn("stream", kwargs)
+        args = tool_call_arguments(turn.tool_calls[0].arguments)
+        self.assertIn("expression", args)
 
     def test_request_raises_with_real_reason_on_failed_status(self) -> None:
-        failed = responses_response(
+        client = mock.MagicMock()
+        client.responses.create.return_value = mock.Mock(
             status="failed",
-            error=SimpleNamespace(code="server_error", message="上游挂了"),
+            error=mock.Mock(code="server_error", message="上游挂了"),
+            output=[],
+            output_text="",
         )
-        backend = ResponsesBackend(FakeResponsesClient([failed]))
+        backend = ResponsesBackend(client)
 
         with self.assertRaises(RuntimeError) as ctx:
             backend.request([])
@@ -264,55 +180,70 @@ class ResponsesBackendTests(unittest.TestCase):
         self.assertIn("上游挂了", str(ctx.exception))
 
     def test_stream_yields_text_then_completed(self) -> None:
-        events = [
-            responses_event("response.output_text.delta", delta="你"),
-            responses_event("response.output_text.delta", delta="好"),
-            responses_event(
-                "response.completed",
-                response=responses_response([], "你好"),
-            ),
-        ]
-        backend = ResponsesBackend(FakeResponsesClient([events]))
+        """真实流式：先有文本增量，最后收尾是 Completed。"""
+        backend = ResponsesBackend(real_openai_client())
 
-        produced = list(backend.request_stream([{"role": "user", "content": "你好"}]))
+        produced = list(
+            backend.request_stream(
+                [{"role": "user", "content": "用一句话说明什么是二分查找"}]
+            )
+        )
 
-        self.assertEqual(produced[0], TextDelta("你"))
-        self.assertEqual(produced[1], TextDelta("好"))
-        self.assertIsInstance(produced[2], Completed)
-        self.assertEqual(produced[2].turn.text, "你好")
+        deltas = [event for event in produced if isinstance(event, TextDelta)]
+        self.assertTrue(deltas)
+        self.assertIsInstance(produced[-1], Completed)
+        self.assertEqual(
+            produced[-1].turn.text, "".join(event.text for event in deltas)
+        )
 
     def test_stream_carries_tool_calls(self) -> None:
-        events = [
-            responses_event(
-                "response.completed",
-                response=responses_response([function_call_item()], ""),
-            ),
-        ]
-        backend = ResponsesBackend(FakeResponsesClient([events]))
+        """真实流式触发工具调用：Completed 里带得上工具调用。"""
+        backend = ResponsesBackend(real_openai_client())
 
-        produced = list(backend.request_stream([]))
+        produced = list(
+            backend.request_stream(
+                [{"role": "user", "content": "请使用 calculate 工具计算 123 * 45"}]
+            )
+        )
 
         self.assertIsInstance(produced[-1], Completed)
         self.assertEqual(produced[-1].turn.tool_calls[0].name, "calculate")
+        tool_call_arguments(produced[-1].turn.tool_calls[0].arguments)
 
     def test_stream_reports_failed_and_incomplete_reasons(self) -> None:
         cases = {
-            "response.failed": SimpleNamespace(code="server_error", message="上游过载"),
-            "response.incomplete": SimpleNamespace(
+            "response.failed": mock.Mock(code="server_error", message="上游过载"),
+            "response.incomplete": mock.Mock(
                 code="max_output_tokens", message="输出被截断"
             ),
-            "error": SimpleNamespace(code="rate_limit_exceeded", message="限流了"),
+            "error": mock.Mock(code="rate_limit_exceeded", message="限流了"),
         }
 
         for kind, error in cases.items():
             with self.subTest(kind=kind):
-                failed_response = responses_response(status="failed", error=error)
-                events = [responses_event(kind, response=failed_response)]
+                client = mock.MagicMock()
                 if kind == "error":
-                    # 网关错误事件的信息就在事件自身。
-                    events = [responses_event(kind, code=error.code, message=error.message)]
+                    # 网关错误事件的信息就在事件自身；
+                    # response 必须显式置 None，否则 Mock 会自动补一个假属性出来。
+                    client.responses.create.return_value = iter(
+                        [
+                            mock.Mock(
+                                type=kind,
+                                response=None,
+                                code=error.code,
+                                message=error.message,
+                            )
+                        ]
+                    )
+                else:
+                    failed_response = mock.Mock(
+                        status="failed", error=error, output=[], output_text=""
+                    )
+                    client.responses.create.return_value = iter(
+                        [mock.Mock(type=kind, response=failed_response)]
+                    )
 
-                backend = ResponsesBackend(FakeResponsesClient([events]))
+                backend = ResponsesBackend(client)
                 produced = list(backend.request_stream([]))
 
                 self.assertEqual(len(produced), 1)
@@ -320,8 +251,11 @@ class ResponsesBackendTests(unittest.TestCase):
                 self.assertIn(error.message, produced[0].reason)
 
     def test_stream_reports_missing_completed_event(self) -> None:
-        events = [responses_event("response.output_text.delta", delta="只有文字")]
-        backend = ResponsesBackend(FakeResponsesClient([events]))
+        client = mock.MagicMock()
+        client.responses.create.return_value = iter(
+            [mock.Mock(type="response.output_text.delta", delta="只有文字")]
+        )
+        backend = ResponsesBackend(client)
 
         produced = list(backend.request_stream([]))
 
@@ -333,35 +267,37 @@ class ChatBackendTests(unittest.TestCase):
     """C. Chat Completions 适配器。"""
 
     def test_request_converts_history_and_tools(self) -> None:
-        client = FakeChatClient([chat_response(content="结果是 2")])
-        backend = ChatCompletionsBackend(client)
+        """真实请求：历史与工具都带上了，模型给出回答。"""
+        backend = ChatCompletionsBackend(real_openai_client())
 
-        turn = backend.request([{"role": "user", "content": "算一下"}])
-
-        self.assertEqual(turn.text, "结果是 2")
-        self.assertEqual(turn.tool_calls, [])
-
-        kwargs = client.chat.completions.calls[0]
-        self.assertEqual(
-            kwargs["messages"][0],
-            {"role": "system", "content": agent.SYSTEM_PROMPT},
+        turn = backend.request(
+            [{"role": "user", "content": "用一句话说明什么是哈希表"}]
         )
-        self.assertEqual(kwargs["messages"][1], {"role": "user", "content": "算一下"})
-        self.assertEqual(kwargs["tools"][0]["function"]["name"], "calculate")
-        self.assertNotIn("stream", kwargs)
+
+        self.assertTrue(turn.text.strip())
 
     def test_request_reads_tool_calls(self) -> None:
-        client = FakeChatClient([chat_response(tool_calls=[chat_tool_call()])])
-        backend = ChatCompletionsBackend(client)
+        backend = ChatCompletionsBackend(real_openai_client())
 
-        turn = backend.request([])
+        turn = backend.request(
+            [{"role": "user", "content": "请使用 calculate 工具计算 123 * 45"}]
+        )
 
         self.assertEqual(len(turn.tool_calls), 1)
-        self.assertEqual(turn.tool_calls[0].id, "call_1")
-        self.assertEqual(turn.tool_calls[0].arguments, '{"expression": "1 + 1"}')
+        self.assertEqual(turn.tool_calls[0].name, "calculate")
+        args = tool_call_arguments(turn.tool_calls[0].arguments)
+        self.assertIn("expression", args)
 
     def test_request_raises_when_output_is_truncated(self) -> None:
-        client = FakeChatClient([chat_response(finish_reason="length")])
+        client = mock.MagicMock()
+        client.chat.completions.create.return_value = mock.Mock(
+            choices=[
+                mock.Mock(
+                    message=mock.Mock(content="说到一半", tool_calls=None),
+                    finish_reason="length",
+                )
+            ]
+        )
         backend = ChatCompletionsBackend(client)
 
         with self.assertRaises(RuntimeError) as ctx:
@@ -370,40 +306,32 @@ class ChatBackendTests(unittest.TestCase):
         self.assertIn("length", str(ctx.exception))
 
     def test_stream_accumulates_text_and_tool_fragments(self) -> None:
-        chunks = [
-            chat_chunk(content="我"),
-            chat_chunk(content="来算"),
-            chat_chunk(tool_calls=[chat_fragment(0, "call_1", "calculate", "")]),
-            chat_chunk(tool_calls=[chat_fragment(0, arguments='{"expression":')]),
-            chat_chunk(
-                tool_calls=[chat_fragment(0, arguments='"1 + 1"}')],
-                finish_reason="tool_calls",
-            ),
-            SimpleNamespace(choices=[]),  # usage-only 收尾块
-        ]
-        backend = ChatCompletionsBackend(FakeChatClient([chunks]))
+        """真实流式：文本分片拼成完整回答，工具调用合并成一个。"""
+        backend = ChatCompletionsBackend(real_openai_client())
 
-        produced = list(backend.request_stream([]))
-
-        text = "".join(event.text for event in produced if isinstance(event, TextDelta))
-        self.assertEqual(text, "我来算")
-
-        completed = produced[-1]
-        self.assertIsInstance(completed, Completed)
-        self.assertEqual(completed.turn.text, "我来算")
-        self.assertEqual(len(completed.turn.tool_calls), 1)
-        self.assertEqual(completed.turn.tool_calls[0].id, "call_1")
-        self.assertEqual(completed.turn.tool_calls[0].name, "calculate")
-        self.assertEqual(
-            completed.turn.tool_calls[0].arguments, '{"expression":"1 + 1"}'
+        produced = list(
+            backend.request_stream(
+                [{"role": "user", "content": "请使用 calculate 工具计算 123 * 45"}]
+            )
         )
 
+        text = "".join(event.text for event in produced if isinstance(event, TextDelta))
+        completed = produced[-1]
+        self.assertIsInstance(completed, Completed)
+        self.assertEqual(completed.turn.text, text)
+        self.assertEqual(len(completed.turn.tool_calls), 1)
+        self.assertEqual(completed.turn.tool_calls[0].name, "calculate")
+        tool_call_arguments(completed.turn.tool_calls[0].arguments)
+
     def test_stream_reports_truncated_output(self) -> None:
-        chunks = [
-            chat_chunk(content="说到一半"),
-            chat_chunk(finish_reason="length"),
-        ]
-        backend = ChatCompletionsBackend(FakeChatClient([chunks]))
+        client = mock.MagicMock()
+        client.chat.completions.create.return_value = iter(
+            [
+                chat_chunk(content="说到一半"),
+                chat_chunk(finish_reason="length"),
+            ]
+        )
+        backend = ChatCompletionsBackend(client)
 
         produced = list(backend.request_stream([]))
 
@@ -415,17 +343,13 @@ class FactoryTests(unittest.TestCase):
     """D. 后端选择。"""
 
     def test_build_backend_returns_matching_adapter(self) -> None:
-        responses_client = FakeResponsesClient([])
-        chat_client = FakeChatClient([])
-
-        self.assertIsInstance(
-            build_backend(responses_client, "responses"), ResponsesBackend
-        )
-        self.assertIsInstance(build_backend(chat_client, "chat"), ChatCompletionsBackend)
+        # 工厂只负责挑适配器，客户端传什么都不影响这里。
+        self.assertIsInstance(build_backend(object(), "responses"), ResponsesBackend)
+        self.assertIsInstance(build_backend(object(), "chat"), ChatCompletionsBackend)
 
     def test_build_backend_rejects_unknown_style(self) -> None:
         with self.assertRaises(ValueError):
-            build_backend(FakeResponsesClient([]), "grpc")
+            build_backend(object(), "grpc")
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ def main() -> None:
                 reconfigure(encoding="utf-8")
             except (ValueError, OSError):
                 pass
-    # 放在函数内导入，测试导入本包时不必初始化 API 客户端。
+    # 放在函数内导入：依赖缺失时在这里给中文提示，而不是让 ImportError 直接抛给用户。
     try:
         from agent_lc.graph import (
             DEFAULT_THREAD_ID,

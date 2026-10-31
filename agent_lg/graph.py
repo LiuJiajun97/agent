@@ -7,13 +7,14 @@ create_agent 生成的图长这样：
     model     -> tools      (条件边)
     tools     -> model      (回边)
 
-本模块用 LangGraph 的 StateGraph API 把这 4 个节点和 4 条边逐条写出来，
+本模块用 LangGraph 的 StateGraph API 把 model / tools 两个节点
+及它们之间的边逐条写出来（__start__ / __end__ 由框架隐式处理），
 方便看清 create_agent 到底替你做了什么。
 
 与另外两套实现的对应关系：
 - agent/loop.py 的 agent_loop()  <-  本文件的 model / tools 节点 + 条件边
 - agent/loop.py 的 history 列表  <-  本文件的 AgentState.messages
-- agent/loop.py 的 MAX_STEPS     <-  本文件的 RECURSION_LIMIT
+- agent/loop.py 的 MAX_STEPS     <-  RECURSION_LIMIT（转发自 agent_lc.graph）
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-from agent.config import MAX_STEPS, SYSTEM_PROMPT
+from agent.config import SYSTEM_PROMPT
 from agent_lc.graph import (
     DEFAULT_THREAD_ID,
     RECURSION_LIMIT,

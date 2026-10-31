@@ -1,6 +1,8 @@
 """配置模块：环境变量、模型名、最大循环步数、系统指令。
 
-包内唯一读取环境变量的模块，其他模块从这里取值，避免重复加载 .env。
+模型名、API 风格、最大步数等配置在这里统一定义，.env 也只在这里加载一次；
+OPENAI_API_KEY / OPENAI_BASE_URL 由 agent/cli.py 与 agent_lc/graph.py 直接读取，
+因为它们要显式传给 SDK。
 """
 
 from __future__ import annotations
@@ -21,7 +23,6 @@ if load_dotenv is not None:
 MODEL = os.getenv("OPENAI_MODEL", "MiniMax-M3.1-Flash")
 
 # API 风格：responses（默认）或 chat。
-# 统一在这里读取并校验，避免各模块各自解析环境变量。
 API_STYLE = os.getenv("OPENAI_API_STYLE", "responses").strip().lower()
 if API_STYLE not in ("responses", "chat"):
     raise ValueError(

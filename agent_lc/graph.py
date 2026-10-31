@@ -139,7 +139,6 @@ def run_turn_stream(
         if not isinstance(chunk, AIMessageChunk):
             # 工具结果等非模型文本，跳过。
             continue
-        # Responses API 下 content 是块列表，要用 message_text 提取纯文本。
         text = message_text(chunk)
         # 空内容的收尾块跳过。
         if text:
@@ -169,7 +168,6 @@ def run_turn(agent: Any, user_text: str, thread_id: str = DEFAULT_THREAD_ID) -> 
         return "（模型没有返回文本）"
 
     last = messages[-1]
-    # Responses API 下 content 是块列表，用 message_text 提取纯文本。
     return message_text(last) or "（模型没有返回文本）"
 
 
